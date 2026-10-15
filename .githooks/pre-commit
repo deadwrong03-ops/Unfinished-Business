@@ -1,0 +1,13 @@
+#!/bin/sh
+repo_root="$(git rev-parse --show-toplevel)"
+script_win="$(cygpath -w "$repo_root/scripts/check-secrets.ps1")"
+
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$script_win"
+status=$?
+
+if [ $status -ne 0 ]; then
+  echo "Commit blocked by secret scan."
+  exit $status
+fi
+
+exit 0
