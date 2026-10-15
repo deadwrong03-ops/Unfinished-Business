@@ -46,9 +46,3 @@ The minimal source files required from Raidcore's Nexus API, Raidcore's ImGui fo
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Before pushing
-
-Run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\check-secrets.ps1
