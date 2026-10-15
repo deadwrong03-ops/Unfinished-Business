@@ -17,14 +17,7 @@ A Guild Wars 2 Nexus addon that finds unfinished achievement opportunities relev
 - Automatic account-progress refresh
 - Local API-key storage protected with Windows DPAPI
 
-## Building
 
-1. Open `GW2Nexus-AddonTemplate.sln` in Visual Studio 2022.
-2. Select `Release | x64`.
-3. Build the solution.
-4. The addon DLL is produced as `x64\UnfinishedBusiness.dll`.
-
-The Visual Studio project keeps the original Raidcore template filenames for now because that is the configuration used during development. The release DLL itself is named `UnfinishedBusiness.dll`.
 
 ## GW2 API key
 
