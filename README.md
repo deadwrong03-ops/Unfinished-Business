@@ -19,7 +19,7 @@ A Guild Wars 2 Nexus addon that finds unfinished achievement opportunities relev
 1. Open `GW2Nexus-AddonTemplate.sln` in Visual Studio 2022.
 2. Select `Release | x64`.
 3. Build the solution.
-4. The addon DLL is produced as `x64\\UnfinishedBusiness.dll`.
+4. The addon DLL is produced as `x64\UnfinishedBusiness.dll`.
 
 The Visual Studio project keeps the original Raidcore template filenames for now because that is the configuration used during development. The release DLL itself is named `UnfinishedBusiness.dll`.
 
@@ -42,26 +42,7 @@ When a compatible NexusGameWiki build is installed, Unfinished Business raises t
 
 ## Dependencies
 
-The minimal source files required from Raidcore's Nexus API, Raidcore's ImGui fork, and the Raidcore Mumble API are vendored under `src/` in this GitHub-ready snapshot. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The minimal source files required from Raidcore's Nexus API, Raidcore's ImGui fork, and the Raidcore Mumble API are vendored under `src/` in this GitHub-ready snapshot.
 
-## Before pushing
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-Run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\\scripts\\check-secrets.ps1
-```
-
-You can also install the included pre-commit hook:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\\scripts\\install-git-hooks.ps1
-```
-
-## Author
-
-`spectre.9510`
-
-## Status
-
-Early development / testing build, version `0.1.0`.
