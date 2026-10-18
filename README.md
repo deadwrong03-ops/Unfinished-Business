@@ -1,48 +1,45 @@
 # Unfinished Business
 
-A Guild Wars 2 Nexus addon that finds unfinished achievement opportunities relevant to the player's current map and ranks useful next targets.
+A Guild Wars 2 Nexus addon that finds unfinished achievement opportunities relevant to your current map and helps surface useful next targets.
 
-## Current features
+## Features
 
-- Current-map opportunity scanning
+- Current-map achievement opportunity scanning
 - Exact, curated, contextual, and limited coverage indicators
 - Progress-aware recommendations
-- Account-tracked and character-specific Adventure Guide handling
-- Filters and ignored achievements
+- Separate handling for account-tracked and character-specific Adventure Guide achievements
+- Filters and ignored-achievement controls
 - Achievement reward and actionability parsing
-- Optional NexusGameWiki integration with Hero-panel fallback
 - Automatic account-progress refresh
-- Local API-key storage protected with Windows DPAPI
+- Optional NexusGameWiki integration
+- Hero-panel fallback when NexusGameWiki is unavailable
+- Local GW2 API-key storage protected with Windows DPAPI
 
-## Building
+## GW2 API Key
 
-1. Open `GW2Nexus-AddonTemplate.sln` in Visual Studio 2022.
-2. Select `Release | x64`.
-3. Build the solution.
-4. The addon DLL is produced as `x64\UnfinishedBusiness.dll`.
-
-The Visual Studio project keeps the original Raidcore template filenames for now because that is the configuration used during development. The release DLL itself is named `UnfinishedBusiness.dll`.
-
-## GW2 API key
-
-Unfinished Business needs a Guild Wars 2 API key with only these permissions:
+Unfinished Business requires a Guild Wars 2 API key with:
 
 - `account`
 - `progression`
 
-The key is sent only to `https://api.guildwars2.com` using an HTTPS `Authorization: Bearer` header. It is not placed in a request URL.
+The key is used only for authenticated requests to the official Guild Wars 2 API.
 
-Saved keys are encrypted using Windows DPAPI for the current Windows user and are stored outside the project directory under Local AppData. The source does not log or display the key after submission.
+Saved keys are encrypted locally with Windows DPAPI for the current Windows user. The addon does not intentionally log or display the key after submission.
 
-See [SECURITY.md](SECURITY.md) for the credential-handling details.
+See [SECURITY.md](SECURITY.md) for additional details.
 
-## NexusGameWiki
+## NexusGameWiki Integration
 
-When a compatible NexusGameWiki build is installed, Unfinished Business raises the `NexusGameWiki.OpenPage.v2` event to open an achievement article in game. If the event is not handled, the addon falls back to copying the achievement name and opening the Hero panel.
+When a compatible NexusGameWiki build is installed, Unfinished Business can open achievement wiki articles directly in game.
 
-## Dependencies
+If NexusGameWiki is unavailable, the addon falls back to copying the achievement name and opening the Hero panel.
 
-The minimal source files required from Raidcore's Nexus API, Raidcore's ImGui fork, and the Raidcore Mumble API are vendored under `src/` in this GitHub-ready snapshot.
+## Author
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+`spectre.9510`
 
+## Status
+
+Early development / testing build.
+
+Current version: `0.1.0`
