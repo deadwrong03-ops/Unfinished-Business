@@ -2,6 +2,13 @@
 
 A Guild Wars 2 Nexus addon that finds unfinished achievement opportunities relevant to your current map and helps surface useful next targets.
 
+<img width="250" height="250" alt="Screenshot 2026-10-15 111958" src="https://github.com/user-attachments/assets/0ff70126-cea3-4617-a6f4-ac9c525021aa" />
+
+
+<img width="250" height="250" alt="Screenshot 2026-10-15 112106" src="https://github.com/user-attachments/assets/a7b1a6f6-829b-4d16-96c2-a49341747e25" />
+
+
+
 ## Features
 
 - Current-map achievement opportunity scanning
