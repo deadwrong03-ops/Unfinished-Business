@@ -45,6 +45,14 @@ void AddonOptions();
 void StartAchievementCategorySync();
 void StartCurrentMapDefinitionSync(const std::vector<int>& aIDs);
 void StartApiKeyValidation();
+
+void StartFestivalScheduleSync();
+void UpdateFestivalScheduleSync();
+void DetectActiveFestivalFromAchievementCategories();
+void UpdateActiveFestivalOpportunityScan();
+void UpdateFestivalDefinitionSync();
+void BuildFestivalOpportunityList();
+void RenderActiveFestivalSection();
 void StartApiKeyValidationForKey(const std::string& aApiKey);
 void StartAchievementSyncWithKey(const std::string& aApiKey);
 void SecureClearString(std::string& aValue);
@@ -52,9 +60,11 @@ void SecureClearApiKeyBuffer();
 
 const AchievementProgress* FindAchievementProgress(int aID);
 bool IsCharacterAdventureGuideAchievement(int aID);
+bool IsRetiredCategoryName(const std::string& aName);
 void BuildCurrentMapOpportunityList();
 void SaveUserPreferences();
 void LoadUserPreferences();
+std::string ToLowerCopy(const std::string& aValue);
 
 /* globals */
 AddonDefinition_t AddonDef = {};
@@ -225,6 +235,110 @@ bool achievementCategoriesLoaded = false;
 std::string achievementCategoryStatus = "Not loaded yet.";
 std::vector<AchievementCategory> achievementCategories;
 std::future<AchievementCategorySyncResult> achievementCategorySyncFuture;
+
+
+/* seasonal festival state */
+struct FestivalDate
+{
+    int Year = 0;
+    int Month = 0;
+    int Day = 0;
+};
+
+struct FestivalDescriptor
+{
+    const char* Key = "";
+    const char* DisplayName = "";
+    const char* WikiPageBase = "";
+    std::vector<std::string> CategoryNameFragments;
+    std::vector<std::string> HostMaps;
+};
+
+struct FestivalScheduleResult
+{
+    bool Success = false;
+    bool Active = false;
+
+    std::string FestivalKey;
+    std::string FestivalName;
+    std::string WikiPageTitle;
+
+    FestivalDate StartDate;
+    FestivalDate EndDate;
+
+    std::string Error;
+};
+
+const std::vector<FestivalDescriptor> FestivalDescriptors =
+{
+    {
+        "lunar_new_year",
+        "Lunar New Year",
+        "Lunar New Year",
+        { "Lunar New Year" },
+        { "Divinity's Reach", "Dragon Ball Arena" }
+    },
+    {
+        "super_adventure_festival",
+        "Super Adventure Festival",
+        "Super Adventure Festival",
+        { "Super Adventure" },
+        { "Rata Sum" }
+    },
+    {
+        "dragon_bash",
+        "Dragon Bash",
+        "Dragon Bash",
+        { "Dragon Bash" },
+        { "Hoelbrak" }
+    },
+    {
+        "festival_of_the_four_winds",
+        "Festival of the Four Winds",
+        "Festival of the Four Winds",
+        { "Festival of the Four Winds" },
+        { "Labyrinthine Cliffs", "The Crown Pavilion" }
+    },
+    {
+        "halloween",
+        "Shadow of the Mad King",
+        "Shadow of the Mad King",
+        { "Halloween", "Shadow of the Mad King", "Lunatic Wardrobe" },
+        { "Lion's Arch", "Mad King's Labyrinth", "Mad King's Clock Tower" }
+    },
+    {
+        "wintersday",
+        "A Very Merry Wintersday",
+        "A Very Merry Wintersday",
+        { "Wintersday" },
+        { "Divinity's Reach" }
+    }
+};
+
+bool festivalScheduleSyncActive = false;
+bool festivalScheduleSyncAttempted = false;
+bool festivalScheduleLastCheckValid = false;
+std::chrono::steady_clock::time_point festivalScheduleLastCheck;
+std::future<FestivalScheduleResult> festivalScheduleFuture;
+
+bool activeFestivalAvailable = false;
+std::string activeFestivalKey;
+std::string activeFestivalName;
+std::string activeFestivalWikiPageTitle;
+FestivalDate activeFestivalStartDate;
+FestivalDate activeFestivalEndDate;
+std::string festivalScheduleStatus =
+"Waiting for the official GW2 event calendar...";
+
+bool festivalOpportunityScanDirty = true;
+bool festivalDefinitionSyncActive = false;
+bool festivalDefinitionsReady = false;
+std::future<AchievementDefinitionSyncResult> festivalDefinitionSyncFuture;
+
+std::vector<std::string> festivalMatchedCategoryNames;
+std::vector<int> festivalCategoryIDs;
+std::vector<int> festivalOpportunityIDs;
+
 
 /* curated map-to-category aliases */
 struct MapCategoryAlias
@@ -1242,6 +1356,70 @@ bool ExtractJsonBoolField(
 }
 
 ///----------------------------------------------------------------------------------------------------
+/// ParseRootJsonIntArray:
+///     Parses a root-level JSON array such as [1,2,3]. Used for the
+///     achievement-category index because that endpoint is the authoritative
+///     list of categories currently exposed by the live GW2 API.
+///----------------------------------------------------------------------------------------------------
+std::vector<int> ParseRootJsonIntArray(
+    const std::string& aJson)
+{
+    std::vector<int> values;
+
+    size_t pos = 0;
+
+    while (pos < aJson.size())
+    {
+        while (pos < aJson.size() &&
+            !std::isdigit(
+                static_cast<unsigned char>(
+                    aJson[pos])) &&
+            aJson[pos] != '-')
+        {
+            ++pos;
+        }
+
+        if (pos >= aJson.size())
+        {
+            break;
+        }
+
+        bool negative = false;
+
+        if (aJson[pos] == '-')
+        {
+            negative = true;
+            ++pos;
+        }
+
+        int value = 0;
+        bool foundDigit = false;
+
+        while (pos < aJson.size() &&
+            std::isdigit(
+                static_cast<unsigned char>(
+                    aJson[pos])))
+        {
+            foundDigit = true;
+            value =
+                (value * 10) +
+                (aJson[pos] - '0');
+
+            ++pos;
+        }
+
+        if (foundDigit)
+        {
+            values.push_back(
+                negative ? -value : value
+            );
+        }
+    }
+
+    return values;
+}
+
+///----------------------------------------------------------------------------------------------------
 /// ExtractJsonIntArray:
 ///----------------------------------------------------------------------------------------------------
 std::vector<int> ExtractJsonIntArray(
@@ -1603,6 +1781,1082 @@ bool HttpGet(
 
     return false;
 }
+
+///----------------------------------------------------------------------------------------------------
+/// ForumHttpGetOnce:
+///     Reads the official Guild Wars 2 forum event calendar.
+///----------------------------------------------------------------------------------------------------
+bool ForumHttpGetOnce(
+    const std::wstring& aPath,
+    DWORD& aStatusCode,
+    std::string& aResponse,
+    std::string& aError)
+{
+    aStatusCode = 0;
+    aResponse.clear();
+    aError.clear();
+
+    HINTERNET hSession = WinHttpOpen(
+        L"UnfinishedBusiness/0.1 (https://github.com/deadwrong03-ops/Unfinished-Business; GW2 Nexus addon)",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0
+    );
+
+    if (hSession == nullptr)
+    {
+        aError = "Could not open official event-calendar HTTP session.";
+        return false;
+    }
+
+    WinHttpSetTimeouts(
+        hSession,
+        3000,
+        3000,
+        3000,
+        6000
+    );
+
+    HINTERNET hConnect = WinHttpConnect(
+        hSession,
+        L"en-forum.guildwars2.com",
+        INTERNET_DEFAULT_HTTPS_PORT,
+        0
+    );
+
+    if (hConnect == nullptr)
+    {
+        WinHttpCloseHandle(hSession);
+        aError = "Could not connect to the official GW2 event calendar.";
+        return false;
+    }
+
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect,
+        L"GET",
+        aPath.c_str(),
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE
+    );
+
+    if (hRequest == nullptr)
+    {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        aError = "Could not create official event-calendar request.";
+        return false;
+    }
+
+    const wchar_t* headers =
+        L"Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8\r\n"
+        L"Accept-Language: en-US,en;q=0.9\r\n";
+
+    WinHttpAddRequestHeaders(
+        hRequest,
+        headers,
+        -1L,
+        WINHTTP_ADDREQ_FLAG_ADD |
+        WINHTTP_ADDREQ_FLAG_REPLACE
+    );
+
+    const BOOL sent = WinHttpSendRequest(
+        hRequest,
+        WINHTTP_NO_ADDITIONAL_HEADERS,
+        0,
+        WINHTTP_NO_REQUEST_DATA,
+        0,
+        0,
+        0
+    );
+
+    if (!sent ||
+        !WinHttpReceiveResponse(
+            hRequest,
+            nullptr))
+    {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        aError = "Official GW2 event-calendar request failed.";
+        return false;
+    }
+
+    DWORD statusSize = sizeof(aStatusCode);
+
+    WinHttpQueryHeaders(
+        hRequest,
+        WINHTTP_QUERY_STATUS_CODE |
+        WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX,
+        &aStatusCode,
+        &statusSize,
+        WINHTTP_NO_HEADER_INDEX
+    );
+
+    while (true)
+    {
+        DWORD bytesAvailable = 0;
+
+        if (!WinHttpQueryDataAvailable(
+            hRequest,
+            &bytesAvailable))
+        {
+            aError =
+                "Could not read the official GW2 event calendar.";
+            break;
+        }
+
+        if (bytesAvailable == 0)
+        {
+            break;
+        }
+
+        std::string buffer(
+            bytesAvailable,
+            '\0'
+        );
+
+        DWORD bytesRead = 0;
+
+        if (!WinHttpReadData(
+            hRequest,
+            &buffer[0],
+            bytesAvailable,
+            &bytesRead))
+        {
+            aError =
+                "Could not read the official GW2 event calendar.";
+            break;
+        }
+
+        buffer.resize(bytesRead);
+        aResponse += buffer;
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    return aError.empty();
+}
+
+///----------------------------------------------------------------------------------------------------
+/// ForumHttpGet:
+///----------------------------------------------------------------------------------------------------
+bool ForumHttpGet(
+    const std::wstring& aPath,
+    DWORD& aStatusCode,
+    std::string& aResponse,
+    std::string& aError)
+{
+    constexpr int maxAttempts = 2;
+
+    for (int attempt = 1;
+        attempt <= maxAttempts;
+        ++attempt)
+    {
+        aStatusCode = 0;
+        aResponse.clear();
+        aError.clear();
+
+        const bool completed =
+            ForumHttpGetOnce(
+                aPath,
+                aStatusCode,
+                aResponse,
+                aError
+            );
+
+        if (completed)
+        {
+            const bool retryable =
+                aStatusCode == 408 ||
+                aStatusCode == 429 ||
+                (aStatusCode >= 500 &&
+                    aStatusCode <= 599);
+
+            if (!retryable)
+            {
+                return true;
+            }
+        }
+
+        if (attempt < maxAttempts)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(500)
+            );
+        }
+    }
+
+    if (aError.empty())
+    {
+        aError =
+            "Official GW2 event-calendar request failed.";
+    }
+
+    return false;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// WikiHttpGetOnce:
+///     Small unauthenticated HTTPS client for the Guild Wars 2 Wiki.
+///----------------------------------------------------------------------------------------------------
+bool WikiHttpGetOnce(
+    const std::wstring& aPath,
+    DWORD& aStatusCode,
+    std::string& aResponse,
+    std::string& aError)
+{
+    aStatusCode = 0;
+    aResponse.clear();
+    aError.clear();
+
+    HINTERNET hSession = WinHttpOpen(
+        L"UnfinishedBusiness/0.1 (https://github.com/deadwrong03-ops/Unfinished-Business; GW2 Nexus addon)",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0
+    );
+
+    if (hSession == nullptr)
+    {
+        aError = "Could not open wiki HTTP session.";
+        return false;
+    }
+
+    WinHttpSetTimeouts(
+        hSession,
+        3000,
+        3000,
+        3000,
+        6000
+    );
+
+    HINTERNET hConnect = WinHttpConnect(
+        hSession,
+        L"wiki.guildwars2.com",
+        INTERNET_DEFAULT_HTTPS_PORT,
+        0
+    );
+
+    if (hConnect == nullptr)
+    {
+        WinHttpCloseHandle(hSession);
+        aError = "Could not connect to the Guild Wars 2 Wiki.";
+        return false;
+    }
+
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect,
+        L"GET",
+        aPath.c_str(),
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE
+    );
+
+    if (hRequest == nullptr)
+    {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        aError = "Could not create wiki request.";
+        return false;
+    }
+
+    const wchar_t* wikiHeaders =
+        L"Api-User-Agent: UnfinishedBusiness/0.1 "
+        L"(https://github.com/deadwrong03-ops/Unfinished-Business)\r\n"
+        L"Accept: application/json,text/plain;q=0.9,*/*;q=0.8\r\n";
+
+    if (!WinHttpAddRequestHeaders(
+        hRequest,
+        wikiHeaders,
+        -1L,
+        WINHTTP_ADDREQ_FLAG_ADD |
+        WINHTTP_ADDREQ_FLAG_REPLACE))
+    {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        aError =
+            "Could not add Guild Wars 2 Wiki request headers.";
+        return false;
+    }
+
+    const BOOL sent = WinHttpSendRequest(
+        hRequest,
+        WINHTTP_NO_ADDITIONAL_HEADERS,
+        0,
+        WINHTTP_NO_REQUEST_DATA,
+        0,
+        0,
+        0
+    );
+
+    if (!sent ||
+        !WinHttpReceiveResponse(hRequest, nullptr))
+    {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        aError = "Guild Wars 2 Wiki request failed.";
+        return false;
+    }
+
+    DWORD statusSize = sizeof(aStatusCode);
+
+    WinHttpQueryHeaders(
+        hRequest,
+        WINHTTP_QUERY_STATUS_CODE |
+        WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX,
+        &aStatusCode,
+        &statusSize,
+        WINHTTP_NO_HEADER_INDEX
+    );
+
+    while (true)
+    {
+        DWORD bytesAvailable = 0;
+
+        if (!WinHttpQueryDataAvailable(
+            hRequest,
+            &bytesAvailable))
+        {
+            aError =
+                "Could not read Guild Wars 2 Wiki response.";
+            break;
+        }
+
+        if (bytesAvailable == 0)
+        {
+            break;
+        }
+
+        std::string buffer(
+            bytesAvailable,
+            '\0'
+        );
+
+        DWORD bytesRead = 0;
+
+        if (!WinHttpReadData(
+            hRequest,
+            &buffer[0],
+            bytesAvailable,
+            &bytesRead))
+        {
+            aError =
+                "Could not read Guild Wars 2 Wiki response.";
+            break;
+        }
+
+        buffer.resize(bytesRead);
+        aResponse += buffer;
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    return aError.empty();
+}
+
+///----------------------------------------------------------------------------------------------------
+/// WikiHttpGet:
+///----------------------------------------------------------------------------------------------------
+bool WikiHttpGet(
+    const std::wstring& aPath,
+    DWORD& aStatusCode,
+    std::string& aResponse,
+    std::string& aError)
+{
+    constexpr int maxAttempts = 2;
+
+    for (int attempt = 1;
+        attempt <= maxAttempts;
+        ++attempt)
+    {
+        aStatusCode = 0;
+        aResponse.clear();
+        aError.clear();
+
+        const bool completed =
+            WikiHttpGetOnce(
+                aPath,
+                aStatusCode,
+                aResponse,
+                aError
+            );
+
+        if (completed)
+        {
+            const bool retryable =
+                aStatusCode == 408 ||
+                aStatusCode == 429 ||
+                (aStatusCode >= 500 &&
+                    aStatusCode <= 599);
+
+            if (!retryable)
+            {
+                return true;
+            }
+        }
+
+        if (attempt < maxAttempts)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(500)
+            );
+        }
+    }
+
+    if (aError.empty())
+    {
+        aError =
+            "Guild Wars 2 Wiki request failed.";
+    }
+
+    return false;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UrlEncodeAscii:
+///----------------------------------------------------------------------------------------------------
+std::string UrlEncodeAscii(
+    const std::string& aValue)
+{
+    static const char hex[] =
+        "0123456789ABCDEF";
+
+    std::string result;
+
+    for (unsigned char ch : aValue)
+    {
+        const bool safe =
+            (ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '-' ||
+            ch == '_' ||
+            ch == '.';
+
+        if (safe)
+        {
+            result.push_back(
+                static_cast<char>(ch)
+            );
+        }
+        else
+        {
+            result.push_back('%');
+            result.push_back(
+                hex[(ch >> 4) & 0x0F]
+            );
+            result.push_back(
+                hex[ch & 0x0F]
+            );
+        }
+    }
+
+    return result;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// GetFestivalDescriptorByKey:
+///----------------------------------------------------------------------------------------------------
+const FestivalDescriptor* GetFestivalDescriptorByKey(
+    const std::string& aKey)
+{
+    for (const FestivalDescriptor& festival :
+        FestivalDescriptors)
+    {
+        if (aKey == festival.Key)
+        {
+            return &festival;
+        }
+    }
+
+    return nullptr;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// FindNextFestivalDate:
+///     Finds the next English "Month D, YYYY" date in wiki intro text.
+///----------------------------------------------------------------------------------------------------
+bool FindNextFestivalDate(
+    const std::string& aText,
+    size_t aStart,
+    FestivalDate& aDate,
+    size_t& aNextPosition)
+{
+    static const char* monthNames[] =
+    {
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December"
+    };
+
+    size_t bestPosition = std::string::npos;
+    int bestMonth = 0;
+    size_t bestMonthLength = 0;
+
+    for (int index = 0; index < 12; ++index)
+    {
+        const std::string monthName =
+            monthNames[index];
+
+        const size_t position =
+            aText.find(
+                monthName,
+                aStart
+            );
+
+        if (position != std::string::npos &&
+            (bestPosition == std::string::npos ||
+                position < bestPosition))
+        {
+            bestPosition = position;
+            bestMonth = index + 1;
+            bestMonthLength =
+                monthName.size();
+        }
+    }
+
+    if (bestPosition == std::string::npos)
+    {
+        return false;
+    }
+
+    size_t pos =
+        bestPosition + bestMonthLength;
+
+    while (pos < aText.size() &&
+        std::isspace(
+            static_cast<unsigned char>(
+                aText[pos])))
+    {
+        ++pos;
+    }
+
+    if (pos >= aText.size() ||
+        !std::isdigit(
+            static_cast<unsigned char>(
+                aText[pos])))
+    {
+        return false;
+    }
+
+    int day = 0;
+
+    while (pos < aText.size() &&
+        std::isdigit(
+            static_cast<unsigned char>(
+                aText[pos])))
+    {
+        day =
+            (day * 10) +
+            (aText[pos] - '0');
+
+        ++pos;
+    }
+
+    while (pos < aText.size() &&
+        (aText[pos] == ',' ||
+            std::isspace(
+                static_cast<unsigned char>(
+                    aText[pos]))))
+    {
+        ++pos;
+    }
+
+    if (pos + 4 > aText.size())
+    {
+        return false;
+    }
+
+    int year = 0;
+
+    for (int index = 0; index < 4; ++index)
+    {
+        if (!std::isdigit(
+            static_cast<unsigned char>(
+                aText[pos + index])))
+        {
+            return false;
+        }
+
+        year =
+            (year * 10) +
+            (aText[pos + index] - '0');
+    }
+
+    aDate.Year = year;
+    aDate.Month = bestMonth;
+    aDate.Day = day;
+    aNextPosition = pos + 4;
+
+    return
+        aDate.Year > 2000 &&
+        aDate.Month >= 1 &&
+        aDate.Month <= 12 &&
+        aDate.Day >= 1 &&
+        aDate.Day <= 31;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// ParseFestivalDateRange:
+///----------------------------------------------------------------------------------------------------
+bool ParseFestivalDateRange(
+    const std::string& aText,
+    FestivalDate& aStartDate,
+    FestivalDate& aEndDate)
+{
+    size_t nextPosition = 0;
+
+    if (!FindNextFestivalDate(
+        aText,
+        0,
+        aStartDate,
+        nextPosition))
+    {
+        return false;
+    }
+
+    if (!FindNextFestivalDate(
+        aText,
+        nextPosition,
+        aEndDate,
+        nextPosition))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// FestivalDateKey:
+///----------------------------------------------------------------------------------------------------
+int FestivalDateKey(
+    const FestivalDate& aDate)
+{
+    return
+        (aDate.Year * 10000) +
+        (aDate.Month * 100) +
+        aDate.Day;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// GetLocalFestivalDate:
+///----------------------------------------------------------------------------------------------------
+FestivalDate GetLocalFestivalDate()
+{
+    SYSTEMTIME localTime = {};
+    GetLocalTime(&localTime);
+
+    FestivalDate date;
+    date.Year = localTime.wYear;
+    date.Month = localTime.wMonth;
+    date.Day = localTime.wDay;
+
+    return date;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// IsFestivalDateActive:
+///----------------------------------------------------------------------------------------------------
+bool IsFestivalDateActive(
+    const FestivalDate& aToday,
+    const FestivalDate& aStartDate,
+    const FestivalDate& aEndDate)
+{
+    const int todayKey =
+        FestivalDateKey(aToday);
+
+    return
+        todayKey >=
+        FestivalDateKey(aStartDate) &&
+        todayKey <=
+        FestivalDateKey(aEndDate);
+}
+
+///----------------------------------------------------------------------------------------------------
+/// BuildFestivalWikiPageTitle:
+///----------------------------------------------------------------------------------------------------
+std::string BuildFestivalWikiPageTitle(
+    const FestivalDescriptor& aFestival,
+    int aYear)
+{
+    return
+        std::string(aFestival.WikiPageBase) +
+        " " +
+        std::to_string(aYear);
+}
+
+///----------------------------------------------------------------------------------------------------
+/// FetchFestivalIntro:
+///----------------------------------------------------------------------------------------------------
+bool FetchFestivalIntro(
+    const std::string& aPageTitle,
+    std::string& aIntro,
+    std::string& aError)
+{
+    aIntro.clear();
+    aError.clear();
+
+    const std::string encodedTitle =
+        UrlEncodeAscii(aPageTitle);
+
+    const std::string pathUtf8 =
+        "/api.php?action=parse"
+        "&prop=wikitext"
+        "&section=0"
+        "&redirects=1"
+        "&format=json"
+        "&formatversion=2"
+        "&page=" +
+        encodedTitle;
+
+    const std::wstring path(
+        pathUtf8.begin(),
+        pathUtf8.end()
+    );
+
+    DWORD statusCode = 0;
+    std::string response;
+
+    if (!WikiHttpGet(
+        path,
+        statusCode,
+        response,
+        aError))
+    {
+        return false;
+    }
+
+    if (statusCode != 200)
+    {
+        if (statusCode == 403)
+        {
+            aError =
+                "Guild Wars 2 Wiki denied the schedule request (HTTP 403).";
+        }
+        else
+        {
+            aError =
+                "Guild Wars 2 Wiki returned HTTP " +
+                std::to_string(statusCode) + ".";
+        }
+
+        return false;
+    }
+
+    // action=parse returns an error object if the page does not exist.
+    if (response.find("\"error\"") !=
+        std::string::npos)
+    {
+        aError =
+            "Festival schedule page is not published yet.";
+
+        return false;
+    }
+
+    aIntro =
+        ExtractJsonStringField(
+            response,
+            "wikitext"
+        );
+
+    if (aIntro.empty())
+    {
+        aError =
+            "Festival schedule page did not contain readable wikitext.";
+
+        return false;
+    }
+
+    return true;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// FetchFestivalSchedule:
+///     Uses the Wiki's year-specific festival pages as the live schedule.
+///----------------------------------------------------------------------------------------------------
+FestivalScheduleResult FetchFestivalSchedule()
+{
+    FestivalScheduleResult result;
+
+    DWORD statusCode = 0;
+    std::string response;
+    std::string error;
+
+    if (!ForumHttpGet(
+        L"/events/",
+        statusCode,
+        response,
+        error))
+    {
+        result.Error = error;
+        return result;
+    }
+
+    if (statusCode != 200)
+    {
+        result.Error =
+            "Official GW2 event calendar returned HTTP " +
+            std::to_string(statusCode) + ".";
+
+        return result;
+    }
+
+    const std::string lowerResponse =
+        ToLowerCopy(response);
+
+    size_t searchPosition = 0;
+    bool sawHappeningNow = false;
+
+    while (true)
+    {
+        const size_t happeningPosition =
+            lowerResponse.find(
+                "happening now",
+                searchPosition
+            );
+
+        if (happeningPosition ==
+            std::string::npos)
+        {
+            break;
+        }
+
+        sawHappeningNow = true;
+
+        const size_t proposedWindowEnd =
+            happeningPosition +
+            static_cast<size_t>(12000);
+
+        const size_t windowEnd =
+            proposedWindowEnd < lowerResponse.size()
+            ? proposedWindowEnd
+            : lowerResponse.size();
+
+        const std::string nearby =
+            lowerResponse.substr(
+                happeningPosition,
+                windowEnd - happeningPosition
+            );
+
+        for (const FestivalDescriptor& festival :
+            FestivalDescriptors)
+        {
+            const std::string primaryName =
+                ToLowerCopy(
+                    festival.DisplayName
+                );
+
+            std::string alternateName;
+
+            if (std::string(festival.Key) ==
+                "halloween")
+            {
+                alternateName =
+                    "shadow of the mad king";
+            }
+            else if (std::string(festival.Key) ==
+                "wintersday")
+            {
+                alternateName =
+                    "wintersday";
+            }
+
+            const bool matchesPrimary =
+                nearby.find(primaryName) !=
+                std::string::npos;
+
+            const bool matchesAlternate =
+                !alternateName.empty() &&
+                nearby.find(alternateName) !=
+                std::string::npos;
+
+            if (!matchesPrimary &&
+                !matchesAlternate)
+            {
+                continue;
+            }
+
+            result.Success = true;
+            result.Active = true;
+            result.FestivalKey =
+                festival.Key;
+            result.FestivalName =
+                festival.DisplayName;
+
+            return result;
+        }
+
+        searchPosition =
+            happeningPosition + 13;
+    }
+
+    result.Success = true;
+    result.Active = false;
+
+    if (sawHappeningNow)
+    {
+        result.Error =
+            "The official calendar has active events, but none matched a supported annual festival.";
+    }
+
+    return result;
+}
+
+
+///----------------------------------------------------------------------------------------------------
+/// StartFestivalScheduleSync:
+///----------------------------------------------------------------------------------------------------
+void StartFestivalScheduleSync()
+{
+    if (festivalScheduleSyncActive)
+    {
+        return;
+    }
+
+    festivalScheduleSyncActive = true;
+    festivalScheduleSyncAttempted = true;
+    festivalScheduleStatus =
+        "Checking Guild Wars 2 Wiki festival schedule...";
+
+    festivalScheduleFuture =
+        std::async(
+            std::launch::async,
+            []()
+            {
+                return FetchFestivalSchedule();
+            }
+        );
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UpdateFestivalScheduleSync:
+///----------------------------------------------------------------------------------------------------
+void UpdateFestivalScheduleSync()
+{
+    if (!festivalScheduleSyncActive)
+    {
+        return;
+    }
+
+    if (festivalScheduleFuture.wait_for(
+        std::chrono::milliseconds(0)) !=
+        std::future_status::ready)
+    {
+        return;
+    }
+
+    FestivalScheduleResult result =
+        festivalScheduleFuture.get();
+
+    festivalScheduleSyncActive = false;
+    festivalScheduleLastCheck =
+        std::chrono::steady_clock::now();
+    festivalScheduleLastCheckValid = true;
+
+    if (!result.Success)
+    {
+        festivalScheduleStatus =
+            result.Error.empty()
+            ? "Festival schedule check failed."
+            : result.Error;
+
+        return;
+    }
+
+    activeFestivalAvailable =
+        result.Active;
+
+    activeFestivalKey =
+        result.FestivalKey;
+
+    activeFestivalName =
+        result.FestivalName;
+
+    activeFestivalWikiPageTitle =
+        result.WikiPageTitle;
+
+    activeFestivalStartDate =
+        result.StartDate;
+
+    activeFestivalEndDate =
+        result.EndDate;
+
+    festivalMatchedCategoryNames.clear();
+    festivalCategoryIDs.clear();
+    festivalOpportunityIDs.clear();
+    festivalDefinitionsReady = false;
+    festivalOpportunityScanDirty = true;
+
+    if (result.Active)
+    {
+        festivalScheduleStatus =
+            "Active festival detected from the official GW2 event calendar.";
+    }
+    else
+    {
+        festivalScheduleStatus =
+            "No supported annual festival is marked active on the official GW2 event calendar.";
+    }
+}
+
+///----------------------------------------------------------------------------------------------------
+/// MaybeRefreshFestivalSchedule:
+///----------------------------------------------------------------------------------------------------
+void MaybeRefreshFestivalSchedule()
+{
+    if (festivalScheduleSyncActive)
+    {
+        return;
+    }
+
+    if (!festivalScheduleSyncAttempted)
+    {
+        StartFestivalScheduleSync();
+        return;
+    }
+
+    if (!festivalScheduleLastCheckValid)
+    {
+        return;
+    }
+
+    const long long elapsedHours =
+        std::chrono::duration_cast<
+        std::chrono::hours>(
+            std::chrono::steady_clock::now() -
+            festivalScheduleLastCheck
+        ).count();
+
+    if (elapsedHours >= 12)
+    {
+        StartFestivalScheduleSync();
+    }
+}
+
 
 ///----------------------------------------------------------------------------------------------------
 /// LookupMapName:
@@ -2609,8 +3863,13 @@ AchievementCategorySyncResult SyncAchievementCategories()
     std::string response;
     std::string error;
 
+    // IMPORTANT:
+    // The root category endpoint is the live index. Festival categories can
+    // disappear from this list while their festival is inactive. Querying
+    // ?ids=all can still expose dormant historical category objects, which
+    // makes it unsuitable for detecting the currently active festival.
     if (!HttpGet(
-        L"/v2/achievements/categories?ids=all&lang=en",
+        L"/v2/achievements/categories",
         "",
         statusCode,
         response,
@@ -2620,48 +3879,121 @@ AchievementCategorySyncResult SyncAchievementCategories()
         return result;
     }
 
-    if (statusCode != 200 && statusCode != 206)
+    if (statusCode != 200 &&
+        statusCode != 206)
     {
         result.Error =
-            "Achievement category request returned HTTP " +
+            "Achievement category index returned HTTP " +
             std::to_string(statusCode) + ".";
+
         return result;
     }
 
-    const std::vector<std::string> objects =
-        SplitTopLevelObjects(response);
+    const std::vector<int> liveCategoryIDs =
+        ParseRootJsonIntArray(response);
 
-    for (const std::string& objectJson : objects)
+    if (liveCategoryIDs.empty())
     {
-        AchievementCategory category;
+        result.Error =
+            "No live achievement category IDs were returned by the GW2 API.";
 
-        if (!ExtractJsonIntField(objectJson, "id", category.ID))
+        return result;
+    }
+
+    constexpr size_t batchSize = 100;
+
+    for (size_t startIndex = 0;
+        startIndex < liveCategoryIDs.size();
+        startIndex += batchSize)
+    {
+        const std::string idList =
+            BuildAchievementIdBatch(
+                liveCategoryIDs,
+                startIndex,
+                batchSize
+            );
+
+        const std::wstring path =
+            L"/v2/achievements/categories?ids=" +
+            std::wstring(
+                idList.begin(),
+                idList.end()
+            ) +
+            L"&lang=en";
+
+        statusCode = 0;
+        response.clear();
+        error.clear();
+
+        if (!HttpGet(
+            path,
+            "",
+            statusCode,
+            response,
+            error))
         {
-            continue;
+            result.Error = error;
+            return result;
         }
 
-        category.Name =
-            ExtractJsonStringField(objectJson, "name");
-
-        category.AchievementIDs =
-            ExtractCategoryAchievementIDs(objectJson);
-
-        if (!category.Name.empty())
+        if (statusCode != 200 &&
+            statusCode != 206)
         {
-            result.Categories.push_back(std::move(category));
+            result.Error =
+                "Achievement category detail request returned HTTP " +
+                std::to_string(statusCode) + ".";
+
+            return result;
+        }
+
+        const std::vector<std::string> objects =
+            SplitTopLevelObjects(response);
+
+        for (const std::string& objectJson :
+            objects)
+        {
+            AchievementCategory category;
+
+            if (!ExtractJsonIntField(
+                objectJson,
+                "id",
+                category.ID))
+            {
+                continue;
+            }
+
+            category.Name =
+                ExtractJsonStringField(
+                    objectJson,
+                    "name"
+                );
+
+            category.AchievementIDs =
+                ExtractCategoryAchievementIDs(
+                    objectJson
+                );
+
+            if (!category.Name.empty())
+            {
+                result.Categories.push_back(
+                    std::move(category)
+                );
+            }
         }
     }
 
     if (result.Categories.empty())
     {
         result.Error =
-            "No achievement categories were returned by the GW2 API.";
+            "No live achievement categories were returned by the GW2 API.";
+
         return result;
     }
 
     result.Success = true;
     return result;
 }
+
 
 ///----------------------------------------------------------------------------------------------------
 /// FetchAchievementDefinitionsForIDs:
@@ -4611,6 +5943,11 @@ void UpdateAchievementCategorySync()
     achievementCategoriesLoaded = true;
     achievementCategoryStatus =
         "Achievement categories loaded.";
+
+    if (activeFestivalAvailable)
+    {
+        festivalOpportunityScanDirty = true;
+    }
 }
 
 ///----------------------------------------------------------------------------------------------------
@@ -4702,6 +6039,145 @@ const AchievementCategory* FindCategoryByName(
 }
 
 ///----------------------------------------------------------------------------------------------------
+/// GetFestivalLiveMarkerCategory:
+///     Festival achievement categories are exposed by the official GW2 API
+///     only while their festival is active. These temporary daily categories
+///     therefore act as a reliable live festival signal without an external
+///     calendar or website scrape.
+///----------------------------------------------------------------------------------------------------
+const char* GetFestivalLiveMarkerCategory(
+    const std::string& aFestivalKey)
+{
+    if (aFestivalKey == "lunar_new_year")
+    {
+        return "Daily Lunar New Year";
+    }
+
+    if (aFestivalKey == "super_adventure_festival")
+    {
+        return "Daily Super Adventure Festival";
+    }
+
+    if (aFestivalKey == "dragon_bash")
+    {
+        return "Daily Dragon Bash";
+    }
+
+    if (aFestivalKey == "festival_of_the_four_winds")
+    {
+        return "Daily Festival of the Four Winds";
+    }
+
+    if (aFestivalKey == "halloween")
+    {
+        return "Halloween Daily";
+    }
+
+    if (aFestivalKey == "wintersday")
+    {
+        return "Wintersday Daily";
+    }
+
+    return nullptr;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// DetectActiveFestivalFromAchievementCategories:
+///     Uses the live /v2/achievements/categories data we already load.
+///     Temporary festival categories disappear from the API outside their
+///     active festival, so no separate seasonal schedule request is needed.
+///----------------------------------------------------------------------------------------------------
+void DetectActiveFestivalFromAchievementCategories()
+{
+    if (!achievementCategoriesLoaded)
+    {
+        return;
+    }
+
+    const std::string previousFestivalKey =
+        activeFestivalKey;
+
+    const bool previouslyActive =
+        activeFestivalAvailable;
+
+    const FestivalDescriptor* detectedFestival =
+        nullptr;
+
+    for (const FestivalDescriptor& festival :
+        FestivalDescriptors)
+    {
+        const char* markerName =
+            GetFestivalLiveMarkerCategory(
+                festival.Key
+            );
+
+        if (markerName == nullptr)
+        {
+            continue;
+        }
+
+        if (FindCategoryByName(markerName) != nullptr)
+        {
+            detectedFestival = &festival;
+            break;
+        }
+    }
+
+    if (detectedFestival == nullptr)
+    {
+        activeFestivalAvailable = false;
+        activeFestivalKey.clear();
+        activeFestivalName.clear();
+        activeFestivalWikiPageTitle.clear();
+        activeFestivalStartDate = {};
+        activeFestivalEndDate = {};
+
+        festivalScheduleStatus =
+            "No active annual festival is exposed by the GW2 API.";
+
+        if (previouslyActive)
+        {
+            festivalMatchedCategoryNames.clear();
+            festivalCategoryIDs.clear();
+            festivalOpportunityIDs.clear();
+            festivalDefinitionsReady = false;
+        }
+
+        festivalOpportunityScanDirty = false;
+        return;
+    }
+
+    activeFestivalAvailable = true;
+    activeFestivalKey =
+        detectedFestival->Key;
+
+    activeFestivalName =
+        detectedFestival->DisplayName;
+
+    activeFestivalWikiPageTitle.clear();
+    activeFestivalStartDate = {};
+    activeFestivalEndDate = {};
+
+    festivalScheduleStatus =
+        "Active festival detected from the live GW2 category index.";
+
+    const bool festivalChanged =
+        !previouslyActive ||
+        previousFestivalKey !=
+        activeFestivalKey;
+
+    if (festivalChanged)
+    {
+        festivalMatchedCategoryNames.clear();
+        festivalCategoryIDs.clear();
+        festivalOpportunityIDs.clear();
+        festivalDefinitionsReady = false;
+    }
+
+    festivalOpportunityScanDirty = true;
+}
+
+///----------------------------------------------------------------------------------------------------
 /// FindMapCategoryAliases:
 ///----------------------------------------------------------------------------------------------------
 const MapCategoryAlias* FindMapCategoryAliases(
@@ -4739,6 +6215,541 @@ void AppendUniqueAchievementIDs(
         }
     }
 }
+
+///----------------------------------------------------------------------------------------------------
+/// DoesFestivalCategoryMatch:
+///----------------------------------------------------------------------------------------------------
+bool DoesFestivalCategoryMatch(
+    const FestivalDescriptor& aFestival,
+    const std::string& aCategoryName)
+{
+    const std::string lowerName =
+        ToLowerCopy(aCategoryName);
+
+    for (const std::string& fragment :
+        aFestival.CategoryNameFragments)
+    {
+        const std::string lowerFragment =
+            ToLowerCopy(fragment);
+
+        if (!lowerFragment.empty() &&
+            lowerName.find(lowerFragment) !=
+            std::string::npos)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// IsCurrentMapFestivalHost:
+///----------------------------------------------------------------------------------------------------
+bool IsCurrentMapFestivalHost()
+{
+    if (!activeFestivalAvailable)
+    {
+        return false;
+    }
+
+    const FestivalDescriptor* festival =
+        GetFestivalDescriptorByKey(
+            activeFestivalKey
+        );
+
+    if (festival == nullptr)
+    {
+        return false;
+    }
+
+    for (const std::string& hostMap :
+        festival->HostMaps)
+    {
+        if (currentMapName == hostMap)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// GetFestivalDateDisplay:
+///----------------------------------------------------------------------------------------------------
+std::string GetFestivalDateDisplay(
+    const FestivalDate& aDate)
+{
+    static const char* monthNames[] =
+    {
+        "",
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec"
+    };
+
+    if (aDate.Month < 1 ||
+        aDate.Month > 12)
+    {
+        return {};
+    }
+
+    return
+        std::string(monthNames[aDate.Month]) +
+        " " +
+        std::to_string(aDate.Day);
+}
+
+///----------------------------------------------------------------------------------------------------
+/// BuildFestivalOpportunityList:
+///----------------------------------------------------------------------------------------------------
+void BuildFestivalOpportunityList()
+{
+    festivalOpportunityIDs.clear();
+
+    if (!activeFestivalAvailable ||
+        !festivalDefinitionsReady)
+    {
+        return;
+    }
+
+    for (int id : festivalCategoryIDs)
+    {
+        const AchievementProgress* progress =
+            FindAchievementProgress(id);
+
+        if ((progress == nullptr ||
+            !progress->Done) &&
+            !IsOpportunityFiltered(id))
+        {
+            festivalOpportunityIDs.push_back(id);
+        }
+    }
+
+    std::sort(
+        festivalOpportunityIDs.begin(),
+        festivalOpportunityIDs.end(),
+        [](int aLeft, int aRight)
+        {
+            const OpportunityRecommendation left =
+                BuildRecommendation(aLeft);
+
+            const OpportunityRecommendation right =
+                BuildRecommendation(aRight);
+
+            if (left.Score != right.Score)
+            {
+                return left.Score > right.Score;
+            }
+
+            auto leftDefinition =
+                achievementDefinitions.find(aLeft);
+
+            auto rightDefinition =
+                achievementDefinitions.find(aRight);
+
+            const std::string leftName =
+                leftDefinition !=
+                achievementDefinitions.end()
+                ? leftDefinition->second.Name
+                : std::string();
+
+            const std::string rightName =
+                rightDefinition !=
+                achievementDefinitions.end()
+                ? rightDefinition->second.Name
+                : std::string();
+
+            return leftName < rightName;
+        }
+    );
+}
+
+///----------------------------------------------------------------------------------------------------
+/// BuildFestivalRecommendations:
+///----------------------------------------------------------------------------------------------------
+std::vector<OpportunityRecommendation>
+BuildFestivalRecommendations()
+{
+    std::vector<OpportunityRecommendation>
+        recommendations;
+
+    for (int id : festivalOpportunityIDs)
+    {
+        recommendations.push_back(
+            BuildRecommendation(id)
+        );
+    }
+
+    std::sort(
+        recommendations.begin(),
+        recommendations.end(),
+        [](const OpportunityRecommendation& aLeft,
+            const OpportunityRecommendation& aRight)
+        {
+            if (aLeft.Score != aRight.Score)
+            {
+                return aLeft.Score > aRight.Score;
+            }
+
+            auto leftDefinition =
+                achievementDefinitions.find(
+                    aLeft.ID
+                );
+
+            auto rightDefinition =
+                achievementDefinitions.find(
+                    aRight.ID
+                );
+
+            const std::string leftName =
+                leftDefinition !=
+                achievementDefinitions.end()
+                ? leftDefinition->second.Name
+                : std::string();
+
+            const std::string rightName =
+                rightDefinition !=
+                achievementDefinitions.end()
+                ? rightDefinition->second.Name
+                : std::string();
+
+            return leftName < rightName;
+        }
+    );
+
+    if (recommendations.size() > 5)
+    {
+        recommendations.resize(5);
+    }
+
+    return recommendations;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// StartFestivalDefinitionSync:
+///----------------------------------------------------------------------------------------------------
+void StartFestivalDefinitionSync()
+{
+    if (festivalDefinitionSyncActive ||
+        festivalCategoryIDs.empty())
+    {
+        return;
+    }
+
+    festivalDefinitionSyncActive = true;
+    festivalDefinitionsReady = false;
+
+    const std::vector<int> idsCopy =
+        festivalCategoryIDs;
+
+    festivalDefinitionSyncFuture =
+        std::async(
+            std::launch::async,
+            [idsCopy]()
+            {
+                return
+                    FetchAchievementDefinitionsForIDs(
+                        idsCopy
+                    );
+            }
+        );
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UpdateFestivalDefinitionSync:
+///----------------------------------------------------------------------------------------------------
+void UpdateFestivalDefinitionSync()
+{
+    if (!festivalDefinitionSyncActive)
+    {
+        return;
+    }
+
+    if (festivalDefinitionSyncFuture.wait_for(
+        std::chrono::milliseconds(0)) !=
+        std::future_status::ready)
+    {
+        return;
+    }
+
+    AchievementDefinitionSyncResult result =
+        festivalDefinitionSyncFuture.get();
+
+    festivalDefinitionSyncActive = false;
+
+    if (!result.Success)
+    {
+        festivalDefinitionsReady = false;
+        return;
+    }
+
+    for (auto& pair : result.Definitions)
+    {
+        achievementDefinitions[pair.first] =
+            std::move(pair.second);
+    }
+
+    festivalDefinitionsReady = true;
+    BuildFestivalOpportunityList();
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UpdateActiveFestivalOpportunityScan:
+///----------------------------------------------------------------------------------------------------
+void UpdateActiveFestivalOpportunityScan()
+{
+    if (!activeFestivalAvailable ||
+        !achievementCategoriesLoaded ||
+        !achievementDataLoaded)
+    {
+        return;
+    }
+
+    if (!festivalOpportunityScanDirty)
+    {
+        return;
+    }
+
+    const FestivalDescriptor* festival =
+        GetFestivalDescriptorByKey(
+            activeFestivalKey
+        );
+
+    if (festival == nullptr)
+    {
+        festivalOpportunityScanDirty = false;
+        return;
+    }
+
+    festivalMatchedCategoryNames.clear();
+    festivalCategoryIDs.clear();
+    festivalOpportunityIDs.clear();
+    festivalDefinitionsReady = false;
+
+    for (const AchievementCategory& category :
+        achievementCategories)
+    {
+        if (IsRetiredCategoryName(
+            category.Name))
+        {
+            continue;
+        }
+
+        if (!DoesFestivalCategoryMatch(
+            *festival,
+            category.Name))
+        {
+            continue;
+        }
+
+        festivalMatchedCategoryNames.push_back(
+            category.Name
+        );
+
+        AppendUniqueAchievementIDs(
+            festivalCategoryIDs,
+            category.AchievementIDs
+        );
+    }
+
+    festivalOpportunityScanDirty = false;
+
+    if (festivalCategoryIDs.empty())
+    {
+        return;
+    }
+
+    StartFestivalDefinitionSync();
+}
+
+///----------------------------------------------------------------------------------------------------
+/// RenderActiveFestivalSection:
+///----------------------------------------------------------------------------------------------------
+void RenderActiveFestivalSection()
+{
+    if (!activeFestivalAvailable)
+    {
+        return;
+    }
+
+    ImGui::Separator();
+
+    ImGui::TextColored(
+        UBSpecialColor(),
+        "Active Festival: %s",
+        activeFestivalName.c_str()
+    );
+
+    if (IsCurrentMapFestivalHost())
+    {
+        ImGui::SameLine();
+
+        ImGui::TextColored(
+            UBSuccessColor(),
+            "| Host location"
+        );
+    }
+
+    ImGui::TextDisabled(
+        "Detected from the official Guild Wars 2 event calendar."
+    );
+
+    if (!apiKeyValid ||
+        !achievementDataLoaded ||
+        !achievementCategoriesLoaded)
+    {
+        ImGui::TextDisabled(
+            "Festival achievements will appear when account "
+            "achievement data is ready."
+        );
+
+        ImGui::Spacing();
+        return;
+    }
+
+    if (festivalDefinitionSyncActive)
+    {
+        ImGui::TextDisabled(
+            "Loading festival achievement details..."
+        );
+
+        ImGui::Spacing();
+        return;
+    }
+
+    if (festivalCategoryIDs.empty())
+    {
+        ImGui::TextDisabled(
+            "The festival is active, but no matching achievement "
+            "categories were found in the GW2 API."
+        );
+
+        ImGui::Spacing();
+        return;
+    }
+
+    if (!festivalDefinitionsReady)
+    {
+        ImGui::TextDisabled(
+            "Preparing festival opportunities..."
+        );
+
+        ImGui::Spacing();
+        return;
+    }
+
+    ImGui::TextDisabled(
+        "%llu unfinished | %llu matched categories",
+        static_cast<unsigned long long>(
+            festivalOpportunityIDs.size()
+            ),
+        static_cast<unsigned long long>(
+            festivalMatchedCategoryNames.size()
+            )
+    );
+
+    if (festivalOpportunityIDs.empty())
+    {
+        ImGui::TextDisabled(
+            "No unfinished festival achievements match your "
+            "current filters."
+        );
+
+        ImGui::Spacing();
+        return;
+    }
+
+    const std::vector<OpportunityRecommendation>
+        recommendations =
+        BuildFestivalRecommendations();
+
+    if (!recommendations.empty())
+    {
+        ImGui::Spacing();
+
+        ImGui::TextColored(
+            UBSpecialColor(),
+            IsCurrentMapFestivalHost()
+            ? "Recommended festival opportunities here"
+            : "Recommended festival opportunities"
+        );
+
+        for (size_t index = 0;
+            index < recommendations.size();
+            ++index)
+        {
+            ImGui::PushID(
+                700000 +
+                static_cast<int>(index)
+            );
+
+            RenderRecommendedOpportunity(
+                recommendations[index]
+            );
+
+            ImGui::PopID();
+
+            if (index + 1 <
+                recommendations.size())
+            {
+                ImGui::Separator();
+            }
+        }
+    }
+
+    ImGui::Spacing();
+
+    if (ImGui::CollapsingHeader(
+        "All unfinished festival achievements"))
+    {
+        if (ImGui::BeginChild(
+            "##FestivalOpportunityList",
+            ImVec2(0.0f, 260.0f),
+            true))
+        {
+            for (size_t index = 0;
+                index < festivalOpportunityIDs.size();
+                ++index)
+            {
+                const int id =
+                    festivalOpportunityIDs[index];
+
+                ImGui::PushID(
+                    710000 +
+                    static_cast<int>(index)
+                );
+
+                RenderRecommendedOpportunity(
+                    BuildRecommendation(id)
+                );
+
+                ImGui::PopID();
+
+                if (index + 1 <
+                    festivalOpportunityIDs.size())
+                {
+                    ImGui::Separator();
+                }
+            }
+        }
+
+        ImGui::EndChild();
+    }
+
+    ImGui::Spacing();
+}
+
 
 ///----------------------------------------------------------------------------------------------------
 /// CoverageLead:
@@ -5500,6 +7511,11 @@ void UpdateAchievementSync()
         // have, so completed items disappear from the current map immediately.
         BuildCurrentMapOpportunityList();
     }
+
+    if (festivalDefinitionsReady)
+    {
+        BuildFestivalOpportunityList();
+    }
 }
 
 ///----------------------------------------------------------------------------------------------------
@@ -5550,6 +7566,12 @@ void StartApiKeyValidationForKey(
     achievementCategories.clear();
     achievementCategoryStatus =
         "Waiting for achievement definitions.";
+
+    festivalMatchedCategoryNames.clear();
+    festivalCategoryIDs.clear();
+    festivalOpportunityIDs.clear();
+    festivalDefinitionsReady = false;
+    festivalOpportunityScanDirty = true;
 
     lastOpportunityMapName.clear();
     currentOpportunityCategoryName.clear();
@@ -5793,6 +7815,20 @@ void AddonUnload()
         currentMapDefinitionSyncActive = false;
     }
 
+    if (festivalScheduleSyncActive &&
+        festivalScheduleFuture.valid())
+    {
+        festivalScheduleFuture.wait();
+        festivalScheduleSyncActive = false;
+    }
+
+    if (festivalDefinitionSyncActive &&
+        festivalDefinitionSyncFuture.valid())
+    {
+        festivalDefinitionSyncFuture.wait();
+        festivalDefinitionSyncActive = false;
+    }
+
     // Best-effort wipe of any remaining plaintext credential material.
     SecureClearString(pendingValidationKey);
     SecureClearApiKeyBuffer();
@@ -5821,6 +7857,10 @@ void AddonRender()
     UpdateAchievementCategorySync();
     UpdateCurrentMapDefinitionSync();
 
+    UpdateFestivalScheduleSync();
+    UpdateFestivalDefinitionSync();
+    MaybeRefreshFestivalSchedule();
+
     if (achievementDefinitionsLoaded &&
         !achievementCategoriesLoaded &&
         !achievementCategorySyncActive &&
@@ -5830,6 +7870,7 @@ void AddonRender()
     }
 
     UpdateCurrentMapOpportunityScan();
+    UpdateActiveFestivalOpportunityScan();
 
     if (autoRefreshAchievementProgress &&
         apiKeyValid &&
@@ -5849,10 +7890,18 @@ void AddonRender()
         }
     }
 
-    if (opportunityFiltersDirty &&
-        !currentOpportunityCategoryIDs.empty())
+    if (opportunityFiltersDirty)
     {
-        BuildCurrentMapOpportunityList();
+        if (!currentOpportunityCategoryIDs.empty())
+        {
+            BuildCurrentMapOpportunityList();
+        }
+
+        if (festivalDefinitionsReady)
+        {
+            BuildFestivalOpportunityList();
+        }
+
         opportunityFiltersDirty = false;
     }
 
@@ -5929,6 +7978,16 @@ void AddonRender()
 
         ImGui::Spacing();
 
+        if (!activeFestivalAvailable)
+        {
+            ImGui::TextDisabled(
+                "Festival detection: %s",
+                festivalScheduleStatus.c_str()
+            );
+        }
+
+        RenderActiveFestivalSection();
+
         if (!apiKeyValid)
         {
             ImGui::TextWrapped(
@@ -5956,10 +8015,22 @@ void AddonRender()
         }
         else if (currentOpportunityCategoryName.empty())
         {
-            ImGui::TextWrapped(
-                "%s",
-                currentOpportunityStatus.c_str()
-            );
+            if (activeFestivalAvailable &&
+                currentOpportunityStatus ==
+                "No achievement mapping exists for this map yet.")
+            {
+                ImGui::TextWrapped(
+                    "No permanent map-specific achievement mapping "
+                    "exists for this map yet."
+                );
+            }
+            else
+            {
+                ImGui::TextWrapped(
+                    "%s",
+                    currentOpportunityStatus.c_str()
+                );
+            }
 
             if (currentCoverageMode == MapCoverageMode::None &&
                 currentMapDefinitionsReady)
@@ -6498,6 +8569,12 @@ void AddonOptions()
         achievementCategories.clear();
         achievementCategoryStatus = "Not loaded yet.";
 
+        festivalMatchedCategoryNames.clear();
+        festivalCategoryIDs.clear();
+        festivalOpportunityIDs.clear();
+        festivalDefinitionsReady = false;
+        festivalOpportunityScanDirty = true;
+
         lastOpportunityMapName.clear();
         currentOpportunityCategoryName.clear();
         currentOpportunityCategoryIDs.clear();
@@ -6534,6 +8611,11 @@ void AddonOptions()
         UBMutedInfoColor(),
         "%s",
         apiKeyStorageStatus.c_str()
+    );
+
+    ImGui::TextDisabled(
+        "Festival detection: %s",
+        festivalScheduleStatus.c_str()
     );
 
     ImGui::Spacing();
