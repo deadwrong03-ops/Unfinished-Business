@@ -1,3 +1,16 @@
+
+> [!IMPORTANT]
+> THIS MOD IS CURRENTLY NOT WORKING DUE TO THE GW2 WIKI BEING DOWN
+
+
+
+
+
+
+
+
+
+
 # Unfinished Business
 
 A Guild Wars 2 Nexus addon that finds unfinished achievement opportunities relevant to your current map and helps surface useful next targets.
