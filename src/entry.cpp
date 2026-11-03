@@ -267,6 +267,7 @@ struct FestivalScheduleResult
     FestivalDate EndDate;
 
     std::string Error;
+    bool UsedOfflineFallback = false;
 };
 
 const std::vector<FestivalDescriptor> FestivalDescriptors =
@@ -329,6 +330,8 @@ FestivalDate activeFestivalStartDate;
 FestivalDate activeFestivalEndDate;
 std::string festivalScheduleStatus =
 "Waiting for the official GW2 event calendar...";
+std::string festivalDetectionSource =
+"Detected from the official Guild Wars 2 event calendar.";
 
 bool festivalOpportunityScanDirty = true;
 bool festivalDefinitionSyncActive = false;
@@ -2497,6 +2500,179 @@ bool IsFestivalDateActive(
 }
 
 ///----------------------------------------------------------------------------------------------------
+/// KnownFestivalWindow:
+///     Offline safety net for confirmed, year-specific dates only. NEVER infer
+///     the same dates for later years. Update the list after official schedules
+///     are published. The main forum calendar remains the primary detector.
+///
+///     DateKey is YYYYMMDD (UTC calendar date). EndMinuteUTC is the first
+///     minute the festival is considered over; 1440 means the end of the UTC
+///     calendar day when a more precise shutdown time is not documented.
+///
+///     Sources checked 2026-11-03:
+///     - Lunar New Year: official forum Feb 03 - Feb 24, 2026.
+///     - Super Adventure Festival: ArenaNet news Apr 14 - May 05, 2026.
+///     - Dragon Bash: GW2 Wiki event history Jun 02 - Jun 23, 2026.
+///     - Four Winds: ArenaNet update Aug 11 - Sep 01, 2026.
+///     - Halloween: ArenaNet Oct 13 - Nov 03, 2026; GW2 Wiki advertises
+///       noon Pacific / UTC-7 on Nov 03 as the cutoff (19:00 UTC).
+///     - Wintersday 2026 was NOT added: a final official end date had not
+///       been confirmed at the time this fallback was authored.
+///----------------------------------------------------------------------------------------------------
+struct KnownFestivalWindow
+{
+    const char* Key;
+    FestivalDate Start;
+    FestivalDate End;
+    int EndMinuteUTC = 1440;
+};
+
+const std::vector<KnownFestivalWindow> KnownFestivalWindows =
+{
+    { "lunar_new_year",            { 2026, 2, 3 },  { 2026, 2, 24 }, 1440 },
+    { "super_adventure_festival", { 2026, 4, 14 }, { 2026, 5, 5 },  1440 },
+    { "dragon_bash",              { 2026, 6, 2 },  { 2026, 6, 23 }, 1440 },
+    { "festival_of_the_four_winds", { 2026, 8, 11 }, { 2026, 9, 1 }, 1440 },
+    { "halloween",                { 2026, 10, 13 }, { 2026, 11, 3 }, 1140 }
+};
+
+const KnownFestivalWindow* FindKnownFestivalWindow(const std::string& aKey)
+{
+    for (const KnownFestivalWindow& window : KnownFestivalWindows)
+    {
+        if (aKey == window.Key)
+        {
+            return &window;
+        }
+    }
+
+    return nullptr;
+}
+
+bool IsWithinKnownFestivalWindow(
+    const KnownFestivalWindow& aWindow,
+    const SYSTEMTIME& aUtc)
+{
+    const FestivalDate today =
+    {
+        static_cast<int>(aUtc.wYear),
+        static_cast<int>(aUtc.wMonth),
+        static_cast<int>(aUtc.wDay)
+    };
+
+    const int dateKey = FestivalDateKey(today);
+    const int startKey = FestivalDateKey(aWindow.Start);
+    const int endKey = FestivalDateKey(aWindow.End);
+
+    if (dateKey < startKey || dateKey > endKey)
+    {
+        return false;
+    }
+
+    if (dateKey == endKey)
+    {
+        const int currentMinuteUTC =
+            static_cast<int>(aUtc.wHour) * 60 +
+            static_cast<int>(aUtc.wMinute);
+
+        if (currentMinuteUTC >= aWindow.EndMinuteUTC)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/// Return a verified, offline result when the live calendar cannot be read.
+/// Unknown dates are never guessed and do not become false positives.
+FestivalScheduleResult OfflineFestivalScheduleFallback(
+    const std::string& aCalendarError)
+{
+    FestivalScheduleResult result;
+    result.Success = true;
+    result.UsedOfflineFallback = true;
+
+    SYSTEMTIME utc = {};
+    GetSystemTime(&utc);
+
+    for (const KnownFestivalWindow& window : KnownFestivalWindows)
+    {
+        if (!IsWithinKnownFestivalWindow(window, utc))
+        {
+            continue;
+        }
+
+        const FestivalDescriptor* festival =
+            GetFestivalDescriptorByKey(window.Key);
+
+        if (festival == nullptr)
+        {
+            continue;
+        }
+
+        result.Active = true;
+        result.FestivalKey = festival->Key;
+        result.FestivalName = festival->DisplayName;
+        result.StartDate = window.Start;
+        result.EndDate = window.End;
+        return result;
+    }
+
+    // A failed network request does not prove there is no festival. In an
+    // uncovered year/window we make no positive claim and display the error.
+    result.Active = false;
+    result.Error =
+        "Official festival calendar unavailable (" + aCalendarError +
+        "); no verified offline festival is active. "
+        "Dates for future festivals must be confirmed.";
+    return result;
+}
+
+/// The clock guard runs every frame, independent of the 12-hour HTTP refresh.
+/// It also rejects stale 'Happening Now' HTML after the known end cutoff.
+void ExpireFestivalAfterVerifiedWindow()
+{
+    if (!activeFestivalAvailable)
+    {
+        return;
+    }
+
+    const KnownFestivalWindow* window =
+        FindKnownFestivalWindow(activeFestivalKey);
+
+    if (window == nullptr)
+    {
+        return;
+    }
+
+    SYSTEMTIME utc = {};
+    GetSystemTime(&utc);
+
+    if (IsWithinKnownFestivalWindow(*window, utc))
+    {
+        return;
+    }
+
+    activeFestivalAvailable = false;
+    activeFestivalKey.clear();
+    activeFestivalName.clear();
+    activeFestivalWikiPageTitle.clear();
+    activeFestivalStartDate = {};
+    activeFestivalEndDate = {};
+
+    festivalMatchedCategoryNames.clear();
+    festivalCategoryIDs.clear();
+    festivalOpportunityIDs.clear();
+    festivalDefinitionsReady = false;
+    festivalOpportunityScanDirty = false;
+    festivalDetectionSource.clear();
+    festivalScheduleStatus =
+        "Verified festival dates have ended. "
+        "Waiting for the next official calendar update.";
+}
+
+///----------------------------------------------------------------------------------------------------
 /// BuildFestivalWikiPageTitle:
 ///----------------------------------------------------------------------------------------------------
 std::string BuildFestivalWikiPageTitle(
@@ -2612,17 +2788,16 @@ FestivalScheduleResult FetchFestivalSchedule()
         response,
         error))
     {
-        result.Error = error;
-        return result;
+        return OfflineFestivalScheduleFallback(
+            error.empty() ? "request failed" : error
+        );
     }
 
     if (statusCode != 200)
     {
-        result.Error =
-            "Official GW2 event calendar returned HTTP " +
-            std::to_string(statusCode) + ".";
-
-        return result;
+        return OfflineFestivalScheduleFallback(
+            "HTTP " + std::to_string(statusCode)
+        );
     }
 
     const std::string lowerResponse =
@@ -2740,7 +2915,7 @@ void StartFestivalScheduleSync()
     festivalScheduleSyncActive = true;
     festivalScheduleSyncAttempted = true;
     festivalScheduleStatus =
-        "Checking Guild Wars 2 Wiki festival schedule...";
+        "Checking the official Guild Wars 2 event calendar...";
 
     festivalScheduleFuture =
         std::async(
@@ -2813,14 +2988,24 @@ void UpdateFestivalScheduleSync()
 
     if (result.Active)
     {
-        festivalScheduleStatus =
-            "Active festival detected from the official GW2 event calendar.";
+        festivalDetectionSource = result.UsedOfflineFallback
+            ? "Detected from verified 2026 offline festival dates (calendar unavailable)."
+            : "Detected from the official Guild Wars 2 event calendar.";
+
+        festivalScheduleStatus = result.UsedOfflineFallback
+            ? "Official calendar unavailable; using the verified 2026 festival schedule."
+            : "Active festival detected from the official GW2 event calendar.";
     }
     else
     {
-        festivalScheduleStatus =
-            "No supported annual festival is marked active on the official GW2 event calendar.";
+        festivalDetectionSource.clear();
+        festivalScheduleStatus = result.UsedOfflineFallback
+            ? result.Error
+            : "No supported annual festival is marked active on the official GW2 event calendar.";
     }
+
+    // A previously cached live response may be stale on a festival's end day.
+    ExpireFestivalAfterVerifiedWindow();
 }
 
 ///----------------------------------------------------------------------------------------------------
@@ -4954,6 +5139,259 @@ ImVec4 UBMutedInfoColor()
     return ImVec4(0.70f, 0.82f, 0.96f, 1.00f);
 }
 
+
+///----------------------------------------------------------------------------------------------------
+/// Classic Unfinished Business presentation helpers (ImGui 1.80 compatible).
+/// Render in a separate draw-list channel so card backgrounds sit BEHIND text,
+/// buttons, popups, and the existing tree-node interactions.
+///----------------------------------------------------------------------------------------------------
+float UBPresentationScale()
+{
+    const float scale = ImGui::GetFontSize() / 13.0f;
+    return scale > 0.75f ? scale : 0.75f;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UBColoredActionButton:
+///     Consistent colored achievement actions.  Only the button presentation
+///     is changed; callers retain their existing Wiki / clipboard / ignore logic.
+///----------------------------------------------------------------------------------------------------
+enum class UBActionButtonKind
+{
+    Wiki,
+    CopyName,
+    CopyAndHero,
+    Ignore
+};
+
+bool UBColoredActionButton(const char* aLabel, UBActionButtonKind aKind)
+{
+    ImVec4 background;
+    ImVec4 hovered;
+    ImVec4 active;
+    ImVec4 border;
+
+    switch (aKind)
+    {
+    case UBActionButtonKind::Wiki:
+        // Reference lookup: blue.
+        background = ImVec4(0.13f, 0.31f, 0.53f, 1.0f);
+        hovered = ImVec4(0.19f, 0.44f, 0.72f, 1.0f);
+        active = ImVec4(0.10f, 0.24f, 0.42f, 1.0f);
+        border = ImVec4(0.37f, 0.67f, 0.96f, 0.75f);
+        break;
+    case UBActionButtonKind::CopyName:
+        // Clipboard-only: teal.
+        background = ImVec4(0.09f, 0.37f, 0.35f, 1.0f);
+        hovered = ImVec4(0.14f, 0.51f, 0.47f, 1.0f);
+        active = ImVec4(0.07f, 0.29f, 0.27f, 1.0f);
+        border = ImVec4(0.35f, 0.78f, 0.70f, 0.75f);
+        break;
+    case UBActionButtonKind::CopyAndHero:
+        // Clipboard + in-game Hero panel: purple.
+        background = ImVec4(0.34f, 0.25f, 0.53f, 1.0f);
+        hovered = ImVec4(0.49f, 0.35f, 0.70f, 1.0f);
+        active = ImVec4(0.26f, 0.19f, 0.41f, 1.0f);
+        border = ImVec4(0.74f, 0.60f, 0.98f, 0.75f);
+        break;
+    default:
+        // Ignore / removal from recommendations: muted red.
+        background = ImVec4(0.46f, 0.19f, 0.21f, 1.0f);
+        hovered = ImVec4(0.64f, 0.27f, 0.30f, 1.0f);
+        active = ImVec4(0.35f, 0.15f, 0.16f, 1.0f);
+        border = ImVec4(0.95f, 0.49f, 0.51f, 0.75f);
+        break;
+    }
+
+    const float scale = UBPresentationScale();
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f * scale);
+    ImGui::PushStyleColor(ImGuiCol_Button, background);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hovered);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, active);
+    ImGui::PushStyleColor(ImGuiCol_Border, border);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.97f, 0.98f, 1.0f, 1.0f));
+
+    const bool clicked = ImGui::SmallButton(aLabel);
+
+    ImGui::PopStyleColor(5);
+    ImGui::PopStyleVar(2);
+    return clicked;
+}
+
+struct UBVisualCard
+{
+    ImDrawList* DrawList = nullptr;
+    ImDrawListSplitter Splitter;
+    ImVec2 Start = ImVec2(0.0f, 0.0f);
+    float Width = 0.0f;
+    bool Subtle = false;
+};
+
+void UBBeginVisualCard(UBVisualCard& aCard, bool aSubtle = false)
+{
+    const float scale = UBPresentationScale();
+    aCard.Start = ImGui::GetCursorScreenPos();
+    aCard.Width = ImGui::GetContentRegionAvail().x;
+    aCard.Subtle = aSubtle;
+    aCard.DrawList = ImGui::GetWindowDrawList();
+    aCard.Splitter.Split(aCard.DrawList, 2);
+    aCard.Splitter.SetCurrentChannel(aCard.DrawList, 1);
+
+    ImGui::BeginGroup();
+    ImGui::Dummy(ImVec2(0.0f, 5.0f * scale));
+    ImGui::Indent(11.0f * scale);
+}
+
+void UBEndVisualCard(UBVisualCard& aCard)
+{
+    const float scale = UBPresentationScale();
+    ImGui::Unindent(11.0f * scale);
+    ImGui::Dummy(ImVec2(0.0f, 6.0f * scale));
+    ImGui::EndGroup();
+
+    const ImVec2 bottom = ImGui::GetItemRectMax();
+    float bottomY = bottom.y;
+    if (bottomY < aCard.Start.y + 28.0f * scale)
+    {
+        bottomY = aCard.Start.y + 28.0f * scale;
+    }
+
+    aCard.Splitter.SetCurrentChannel(aCard.DrawList, 0);
+    const ImVec4 fill = aCard.Subtle
+        ? ImVec4(0.095f, 0.115f, 0.145f, 0.93f)
+        : ImVec4(0.105f, 0.130f, 0.165f, 0.96f);
+    const ImU32 fillColor = ImGui::GetColorU32(fill);
+    const ImU32 borderColor = ImGui::GetColorU32(
+        ImVec4(0.23f, 0.28f, 0.34f, 0.60f));
+
+    aCard.DrawList->AddRectFilled(
+        aCard.Start,
+        ImVec2(aCard.Start.x + aCard.Width, bottomY),
+        fillColor,
+        5.0f * scale);
+    aCard.DrawList->AddRect(
+        aCard.Start,
+        ImVec2(aCard.Start.x + aCard.Width, bottomY),
+        borderColor,
+        5.0f * scale);
+
+    aCard.Splitter.SetCurrentChannel(aCard.DrawList, 1);
+    aCard.Splitter.Merge(aCard.DrawList);
+    ImGui::Dummy(ImVec2(0.0f, 4.0f * scale));
+}
+
+void UBRenderThinProgressBar(double aRatio)
+{
+    const float scale = UBPresentationScale();
+    const float width = ImGui::GetContentRegionAvail().x - 5.0f * scale;
+    if (width <= 0.0f)
+    {
+        return;
+    }
+
+    float fraction = static_cast<float>(aRatio);
+    if (fraction < 0.0f) fraction = 0.0f;
+    if (fraction > 1.0f) fraction = 1.0f;
+
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float height = 4.0f * scale;
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        p, ImVec2(p.x + width, p.y + height),
+        ImGui::GetColorU32(ImVec4(0.29f, 0.34f, 0.42f, 0.80f)),
+        2.0f * scale);
+    if (fraction > 0.0f)
+    {
+        drawList->AddRectFilled(
+            p, ImVec2(p.x + width * fraction, p.y + height),
+            ImGui::GetColorU32(UBWarningColor()),
+            2.0f * scale);
+    }
+    ImGui::Dummy(ImVec2(width, height));
+}
+
+void UBRenderProgressCardSummary(int aID, const AchievementProgress* aProgress,
+    const std::string& aReason)
+{
+    const bool characterOnly = IsCharacterAdventureGuideAchievement(aID);
+    if (characterOnly)
+    {
+        ImGui::TextColored(UBSpecialColor(), "Progress in-game only");
+    }
+    else if (aProgress == nullptr)
+    {
+        ImGui::TextColored(UBDangerColor(), "Not started");
+    }
+    else if (aProgress->Current >= 0 && aProgress->Max > 0)
+    {
+        const double ratio = GetAchievementProgressRatio(aID);
+        const int pct = static_cast<int>(ratio * 100.0 + 0.5);
+        ImGui::TextColored(UBWarningColor(), "%d/%d (%d%%)",
+            aProgress->Current, aProgress->Max, pct);
+        UBRenderThinProgressBar(ratio);
+        ImGui::TextDisabled("%d%% complete", pct);
+    }
+    else
+    {
+        ImGui::TextColored(UBWarningColor(), "In progress");
+    }
+
+    if (!aReason.empty())
+    {
+        ImGui::TextWrapped("%s", aReason.c_str());
+    }
+}
+
+void UBRenderSummaryStat(const char* aLabel, size_t aValue,
+    const ImVec4& aColor, float aWidth)
+{
+    const float scale = UBPresentationScale();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float height = 58.0f * scale;
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        p, ImVec2(p.x + aWidth, p.y + height),
+        ImGui::GetColorU32(ImVec4(0.105f, 0.13f, 0.165f, 0.96f)),
+        5.0f * scale);
+    drawList->AddRect(
+        p, ImVec2(p.x + aWidth, p.y + height),
+        ImGui::GetColorU32(ImVec4(0.23f, 0.28f, 0.34f, 0.52f)),
+        5.0f * scale);
+    const std::string valueText = std::to_string(aValue);
+    drawList->AddText(
+        ImVec2(p.x + 12.0f * scale, p.y + 9.0f * scale),
+        ImGui::GetColorU32(aColor), valueText.c_str());
+    drawList->AddText(
+        ImVec2(p.x + 12.0f * scale, p.y + 30.0f * scale),
+        ImGui::GetColorU32(ImVec4(0.72f, 0.76f, 0.82f, 1.0f)),
+        aLabel);
+    ImGui::Dummy(ImVec2(aWidth, height));
+}
+
+void UBRenderMapSummaryStats(size_t aAlmostDone, size_t aInProgress,
+    size_t aNotStarted, size_t aCharacterSpecific)
+{
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float gap = 8.0f * UBPresentationScale();
+    const float statWidth = (width - 2.0f * gap) / 3.0f;
+    if (statWidth <= 1.0f)
+    {
+        return;
+    }
+    UBRenderSummaryStat("Almost done", aAlmostDone, UBSuccessColor(), statWidth);
+    ImGui::SameLine(0.0f, gap);
+    UBRenderSummaryStat("In progress", aInProgress, UBWarningColor(), statWidth);
+    ImGui::SameLine(0.0f, gap);
+    UBRenderSummaryStat("Not started", aNotStarted, UBDangerColor(), statWidth);
+    if (aCharacterSpecific > 0)
+    {
+        ImGui::TextColored(UBSpecialColor(),
+            "%llu character-specific achievement(s) have progress in-game only",
+            static_cast<unsigned long long>(aCharacterSpecific));
+    }
+}
+
 ImVec4 GetOpportunityDisplayColor(int aID)
 {
     if (IsCharacterAdventureGuideAchievement(aID))
@@ -5178,48 +5616,32 @@ void RenderRecommendedOpportunity(
         ? definition->Name.c_str()
         : "(Unknown achievement)";
 
-    std::string progressText;
-
-    if (IsCharacterAdventureGuideAchievement(
-        aRecommendation.ID))
-    {
-        progressText = "Progress in-game only";
-    }
-    else if (progress == nullptr)
-    {
-        progressText = "Not started";
-    }
-    else if (progress->Current >= 0 && progress->Max > 0)
-    {
-        const double ratio =
-            GetAchievementProgressRatio(
-                aRecommendation.ID
-            );
-
-        const int percent =
-            static_cast<int>((ratio * 100.0) + 0.5);
-
-        progressText =
-            std::to_string(progress->Current) +
-            "/" +
-            std::to_string(progress->Max) +
-            " (" +
-            std::to_string(percent) +
-            "%)";
-    }
-    else
-    {
-        progressText = "Started";
-    }
-
     std::string primaryReason;
 
-    if (!aRecommendation.Reasons.empty())
+    // The card already displays the numeric percentage above its progress
+    // bar. Prefer a different recommendation reason to avoid saying the same
+    // percentage twice (for example, "33% complete" on two lines).
+    for (const std::string& reason : aRecommendation.Reasons)
     {
-        primaryReason = aRecommendation.Reasons.front();
+        if (progress != nullptr &&
+            progress->Current >= 0 && progress->Max > 0)
+        {
+            const int percent = static_cast<int>(
+                GetAchievementProgressRatio(aRecommendation.ID) * 100.0 + 0.5);
+            if (reason == std::to_string(percent) + "% complete")
+            {
+                continue;
+            }
+        }
+
+        primaryReason = reason;
+        break;
     }
-    else if (IsCharacterAdventureGuideAchievement(
-        aRecommendation.ID))
+
+    if (primaryReason.empty() &&
+        aRecommendation.Reasons.empty() &&
+        IsCharacterAdventureGuideAchievement(
+            aRecommendation.ID))
     {
         if (definition != nullptr)
         {
@@ -5234,50 +5656,18 @@ void RenderRecommendedOpportunity(
         // the limitation clearly. Keep the row compact.
     }
 
-    std::string label =
-        std::string(name) +
-        "  |  " +
-        progressText;
+    // Classic spacious achievement card: name, independent progress text,
+    // a visible progress bar and a short reason. Keep the existing detailed
+    // tree contents, context menu and actions untouched below this header.
+    UBVisualCard visualCard;
+    UBBeginVisualCard(visualCard);
 
-    if (!primaryReason.empty())
-    {
-        label +=
-            "  |  " +
-            primaryReason;
-    }
-
-    const std::string actionabilityTag =
-        GetActionabilityLabel(
-            aRecommendation.ID
-        );
-
-    if (!actionabilityTag.empty() &&
-        actionabilityTag != "General")
-    {
-        label +=
-            "  |  [" +
-            actionabilityTag +
-            "]";
-    }
-
-    label +=
-        "##recommended_" +
+    const std::string label =
+        std::string(name) + "##recommended_" +
         std::to_string(aRecommendation.ID);
 
-    ImGui::PushStyleColor(
-        ImGuiCol_Text,
-        GetOpportunityDisplayColor(
-            aRecommendation.ID
-        )
-    );
-
-    const bool recommendationOpen =
-        ImGui::TreeNodeEx(
-            label.c_str(),
-            ImGuiTreeNodeFlags_SpanAvailWidth
-        );
-
-    ImGui::PopStyleColor();
+    const bool recommendationOpen = ImGui::TreeNodeEx(
+        label.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
 
     if (ImGui::BeginPopupContextItem(
         ("##recommended_context_" +
@@ -5299,6 +5689,16 @@ void RenderRecommendedOpportunity(
         }
 
         ImGui::EndPopup();
+    }
+
+    UBRenderProgressCardSummary(
+        aRecommendation.ID, progress, primaryReason);
+
+    const std::string actionabilityTag =
+        GetActionabilityLabel(aRecommendation.ID);
+    if (!actionabilityTag.empty() && actionabilityTag != "General")
+    {
+        ImGui::TextDisabled("Type: %s", actionabilityTag.c_str());
     }
 
     if (recommendationOpen)
@@ -5397,28 +5797,28 @@ void RenderRecommendedOpportunity(
 
         ImGui::Spacing();
 
-        if (ImGui::SmallButton("Open Wiki"))
+        if (UBColoredActionButton("Open Wiki", UBActionButtonKind::Wiki))
         {
             OpenAchievementInNexusGameWiki(name);
         }
 
         ImGui::SameLine();
 
-        if (ImGui::SmallButton("Copy name"))
+        if (UBColoredActionButton("Copy name", UBActionButtonKind::CopyName))
         {
             CopyAchievementName(name);
         }
 
         ImGui::SameLine();
 
-        if (ImGui::SmallButton("Copy + Hero"))
+        if (UBColoredActionButton("Copy + Hero", UBActionButtonKind::CopyAndHero))
         {
             CopyAchievementNameAndOpenHero(name);
         }
 
         ImGui::SameLine();
 
-        if (ImGui::SmallButton("Ignore this achievement"))
+        if (UBColoredActionButton("Ignore this achievement", UBActionButtonKind::Ignore))
         {
             IgnoreAchievement(
                 aRecommendation.ID
@@ -5433,6 +5833,8 @@ void RenderRecommendedOpportunity(
         ImGui::Unindent();
         ImGui::TreePop();
     }
+
+    UBEndVisualCard(visualCard);
 }
 
 ///----------------------------------------------------------------------------------------------------
@@ -5456,75 +5858,14 @@ void RenderOpportunityRow(int aID)
         ? definition->Name.c_str()
         : "(Unknown achievement)";
 
-    std::string label = name;
+    UBVisualCard visualCard;
+    UBBeginVisualCard(visualCard, true);
 
-    if (IsCharacterAdventureGuideAchievement(aID))
-    {
-        label += "  |  Progress in-game only";
-    }
-    else if (progress == nullptr)
-    {
-        label += "  |  Not started";
-    }
-    else if (progress->Current >= 0 && progress->Max > 0)
-    {
-        const double ratio =
-            GetAchievementProgressRatio(aID);
+    const std::string label =
+        std::string(name) + "##achievement_" + std::to_string(aID);
 
-        const int percent =
-            static_cast<int>((ratio * 100.0) + 0.5);
-
-        label +=
-            "  |  " +
-            std::to_string(progress->Current) +
-            "/" +
-            std::to_string(progress->Max) +
-            " (" +
-            std::to_string(percent) +
-            "%)";
-    }
-    else
-    {
-        label += "  |  Started";
-    }
-
-    if (definition != nullptr)
-    {
-        const std::string rewardSummary =
-            BuildRewardSummary(aID, *definition);
-
-        if (!rewardSummary.empty())
-        {
-            label += "  |  " + rewardSummary;
-        }
-    }
-
-    const std::string actionabilityTag =
-        GetActionabilityLabel(aID);
-
-    if (!actionabilityTag.empty() &&
-        actionabilityTag != "General")
-    {
-        label +=
-            "  |  [" +
-            actionabilityTag +
-            "]";
-    }
-
-    label += "##achievement_" + std::to_string(aID);
-
-    ImGui::PushStyleColor(
-        ImGuiCol_Text,
-        GetOpportunityDisplayColor(aID)
-    );
-
-    const bool opportunityOpen =
-        ImGui::TreeNodeEx(
-            label.c_str(),
-            ImGuiTreeNodeFlags_SpanAvailWidth
-        );
-
-    ImGui::PopStyleColor();
+    const bool opportunityOpen = ImGui::TreeNodeEx(
+        label.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
 
     if (ImGui::BeginPopupContextItem(
         ("##achievement_context_" +
@@ -5547,6 +5888,13 @@ void RenderOpportunityRow(int aID)
 
         ImGui::EndPopup();
     }
+
+    std::string compactReason;
+    if (definition != nullptr)
+    {
+        compactReason = BuildRewardSummary(aID, *definition);
+    }
+    UBRenderProgressCardSummary(aID, progress, compactReason);
 
     if (opportunityOpen)
     {
@@ -5689,28 +6037,28 @@ void RenderOpportunityRow(int aID)
 
         ImGui::Spacing();
 
-        if (ImGui::SmallButton("Open Wiki"))
+        if (UBColoredActionButton("Open Wiki", UBActionButtonKind::Wiki))
         {
             OpenAchievementInNexusGameWiki(name);
         }
 
         ImGui::SameLine();
 
-        if (ImGui::SmallButton("Copy name"))
+        if (UBColoredActionButton("Copy name", UBActionButtonKind::CopyName))
         {
             CopyAchievementName(name);
         }
 
         ImGui::SameLine();
 
-        if (ImGui::SmallButton("Copy + Hero"))
+        if (UBColoredActionButton("Copy + Hero", UBActionButtonKind::CopyAndHero))
         {
             CopyAchievementNameAndOpenHero(name);
         }
 
         ImGui::SameLine();
 
-        if (ImGui::SmallButton("Ignore this achievement"))
+        if (UBColoredActionButton("Ignore this achievement", UBActionButtonKind::Ignore))
         {
             IgnoreAchievement(aID);
         }
@@ -5720,6 +6068,8 @@ void RenderOpportunityRow(int aID)
         ImGui::Unindent();
         ImGui::TreePop();
     }
+
+    UBEndVisualCard(visualCard);
 }
 
 ///----------------------------------------------------------------------------------------------------
@@ -6602,7 +6952,8 @@ void RenderActiveFestivalSection()
     }
 
     ImGui::TextDisabled(
-        "Detected from the official Guild Wars 2 event calendar."
+        "%s",
+        festivalDetectionSource.c_str()
     );
 
     if (!apiKeyValid ||
@@ -6700,11 +7051,6 @@ void RenderActiveFestivalSection()
 
             ImGui::PopID();
 
-            if (index + 1 <
-                recommendations.size())
-            {
-                ImGui::Separator();
-            }
         }
     }
 
@@ -6736,11 +7082,6 @@ void RenderActiveFestivalSection()
 
                 ImGui::PopID();
 
-                if (index + 1 <
-                    festivalOpportunityIDs.size())
-                {
-                    ImGui::Separator();
-                }
             }
         }
 
@@ -7767,7 +8108,7 @@ void AddonLoad(AddonAPI_t* aApi)
     APIDefs->Log(
         LOGL_DEBUG,
         "Unfinished Business",
-        "Unfinished Business v0.1.1 loaded."
+        "Unfinished Business v0.1.2 loaded."
     );
 }
 
@@ -7844,6 +8185,618 @@ void AddonUnload()
 }
 
 ///----------------------------------------------------------------------------------------------------
+/// Tabbed map presentation. Category splitting is a view-only operation:
+/// achievement data, recommendation scores, ignore lists and refreshes stay intact.
+///----------------------------------------------------------------------------------------------------
+bool UBIsMasteryPointAchievement(int aID)
+{
+    const auto found = achievementDefinitions.find(aID);
+    return found != achievementDefinitions.end() &&
+        found->second.RewardsMastery;
+}
+
+std::vector<int> UBGetMapTabOpportunityIDs(bool aMasteryTab)
+{
+    std::vector<int> ids;
+    ids.reserve(currentMapOpportunityIDs.size());
+
+    for (int id : currentMapOpportunityIDs)
+    {
+        if (UBIsMasteryPointAchievement(id) == aMasteryTab)
+        {
+            ids.push_back(id);
+        }
+    }
+
+    return ids;
+}
+
+size_t UBCountCharacterSpecificOpportunities(const std::vector<int>& aIDs)
+{
+    size_t count = 0;
+    for (int id : aIDs)
+    {
+        if (IsCharacterAdventureGuideAchievement(id))
+        {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool UBHasAccountTrackedOpportunities(const std::vector<int>& aIDs)
+{
+    for (int id : aIDs)
+    {
+        if (!IsCharacterAdventureGuideAchievement(id))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void UBCountMapTabOpportunityGroups(
+    const std::vector<int>& aIDs,
+    size_t& aAlmostDone,
+    size_t& aInProgress,
+    size_t& aNotStarted,
+    size_t& aCharacterSpecific)
+{
+    aAlmostDone = 0;
+    aInProgress = 0;
+    aNotStarted = 0;
+    aCharacterSpecific = 0;
+
+    for (int id : aIDs)
+    {
+        if (IsCharacterAdventureGuideAchievement(id))
+        {
+            ++aCharacterSpecific;
+            continue;
+        }
+
+        if (FindAchievementProgress(id) == nullptr)
+        {
+            ++aNotStarted;
+        }
+        else if (GetAchievementProgressRatio(id) >= 0.75)
+        {
+            ++aAlmostDone;
+        }
+        else
+        {
+            ++aInProgress;
+        }
+    }
+}
+
+std::vector<OpportunityRecommendation> UBBuildMapTabRecommendations(
+    const std::vector<int>& aIDs)
+{
+    std::vector<OpportunityRecommendation> recommendations;
+
+    for (int id : aIDs)
+    {
+        // Character Adventure Guide has no reliable per-character API progress.
+        if (!IsCharacterAdventureGuideAchievement(id))
+        {
+            recommendations.push_back(BuildRecommendation(id));
+        }
+    }
+
+    std::sort(recommendations.begin(), recommendations.end(),
+        [](const OpportunityRecommendation& a, const OpportunityRecommendation& b)
+        {
+            if (a.Score != b.Score)
+            {
+                return a.Score > b.Score;
+            }
+
+            auto aDefinition = achievementDefinitions.find(a.ID);
+            auto bDefinition = achievementDefinitions.find(b.ID);
+            const std::string aName =
+                aDefinition != achievementDefinitions.end()
+                ? aDefinition->second.Name : std::string();
+            const std::string bName =
+                bDefinition != achievementDefinitions.end()
+                ? bDefinition->second.Name : std::string();
+            return aName < bName;
+        });
+
+    if (recommendations.size() > 5)
+    {
+        recommendations.resize(5);
+    }
+    return recommendations;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UBRenderMapTab: all the original card actions and list details, scoped to
+/// either ordinary map achievements or mastery-point achievements.
+///----------------------------------------------------------------------------------------------------
+void UBRenderMapTab(bool masteryTab)
+{
+    if (!apiKeyValid)
+    {
+        ImGui::TextWrapped(
+            "GW2 API access is not ready. Open Nexus Options -> "
+            "Unfinished Business to add or validate an API key."
+        );
+    }
+    else if (achievementSyncActive ||
+        achievementDefinitionSyncActive ||
+        achievementCategorySyncActive ||
+        currentMapDefinitionSyncActive)
+    {
+        ImGui::TextDisabled("Refreshing achievement data...");
+    }
+    else if (!achievementDataLoaded)
+    {
+        ImGui::TextDisabled("Waiting for achievement data...");
+    }
+    else if (!achievementCategoriesLoaded)
+    {
+        ImGui::TextWrapped(
+            "%s",
+            achievementCategoryStatus.c_str()
+        );
+    }
+    else if (currentOpportunityCategoryName.empty())
+    {
+        if (masteryTab)
+        {
+            ImGui::TextDisabled(
+                "No mapped mastery-point achievements on this map."
+            );
+            return;
+        }
+
+        if (activeFestivalAvailable &&
+            currentOpportunityStatus ==
+            "No achievement mapping exists for this map yet.")
+        {
+            ImGui::TextWrapped(
+                "No permanent map-specific achievement mapping "
+                "exists for this map yet."
+            );
+        }
+        else
+        {
+            ImGui::TextWrapped(
+                "%s",
+                currentOpportunityStatus.c_str()
+            );
+        }
+
+        if (!masteryTab &&
+            currentCoverageMode == MapCoverageMode::None &&
+            currentMapDefinitionsReady)
+        {
+            ImGui::Spacing();
+            ImGui::Separator();
+            RenderLimitedCoverageLeads();
+        }
+    }
+    else if (currentMapDefinitionsReady)
+    {
+        // Separate mastery-point rewards from the standard achievement list.
+        // The view is filtered at render time: the underlying scanners,
+        // ranking metadata, and achievement lists are not changed.
+        const std::vector<int> tabOpportunityIDs =
+            UBGetMapTabOpportunityIDs(masteryTab);
+
+        if (tabOpportunityIDs.empty())
+        {
+            ImGui::TextDisabled(
+                masteryTab
+                ? "No unfinished mastery-point achievements for this map."
+                : "No unfinished regular achievements for this map."
+            );
+            return;
+        }
+
+        size_t almostDoneCount = 0;
+        size_t inProgressCount = 0;
+        size_t notStartedCount = 0;
+        size_t characterSpecificCount = 0;
+
+        UBCountMapTabOpportunityGroups(
+            tabOpportunityIDs,
+            almostDoneCount,
+            inProgressCount,
+            notStartedCount,
+            characterSpecificCount
+        );
+
+        ImGui::TextColored(
+            masteryTab ? UBSpecialColor() : UBAccentColor(),
+            masteryTab ? "Mastery-point achievements" : "Map achievements"
+        );
+        ImGui::TextDisabled("%llu unfinished in this category",
+            static_cast<unsigned long long>(tabOpportunityIDs.size()));
+        ImGui::Spacing();
+
+        UBRenderMapSummaryStats(
+            almostDoneCount,
+            inProgressCount,
+            notStartedCount,
+            characterSpecificCount
+        );
+
+        ImGui::Spacing();
+        ImGui::Separator();
+
+        const size_t characterSpecificTopCount =
+            UBCountCharacterSpecificOpportunities(tabOpportunityIDs);
+
+        const bool hasAccountTracked =
+            UBHasAccountTrackedOpportunities(tabOpportunityIDs);
+
+        if (!hasAccountTracked &&
+            characterSpecificTopCount > 0)
+        {
+            ImGui::TextColored(
+                UBSpecialColor(),
+                "Character-specific opportunities in %s",
+                currentOpportunityCategoryName.c_str()
+            );
+
+            ImGui::TextDisabled(
+                "Exact progress is only visible in the in-game "
+                "Achievements panel."
+            );
+
+            ImGui::Spacing();
+
+            for (int id : tabOpportunityIDs)
+            {
+                if (!IsCharacterAdventureGuideAchievement(id))
+                {
+                    continue;
+                }
+
+                OpportunityRecommendation opportunity =
+                    BuildRecommendation(id);
+
+                ImGui::PushID(id);
+                RenderRecommendedOpportunity(opportunity);
+                ImGui::PopID();
+            }
+        }
+        else
+        {
+            ImGui::TextColored(
+                UBAccentColor(),
+                masteryTab
+                ? "Recommended mastery points in %s"
+                : "Recommended achievements in %s",
+                currentOpportunityCategoryName.c_str()
+            );
+
+            ImGui::Spacing();
+
+            const std::vector<OpportunityRecommendation>
+                recommendations =
+                UBBuildMapTabRecommendations(tabOpportunityIDs);
+
+            if (recommendations.empty())
+            {
+                ImGui::TextDisabled(
+                    "No recommendations available."
+                );
+            }
+            else
+            {
+                for (size_t recommendationIndex = 0;
+                    recommendationIndex < recommendations.size();
+                    ++recommendationIndex)
+                {
+                    const OpportunityRecommendation&
+                        recommendation =
+                        recommendations[recommendationIndex];
+
+                    ImGui::PushID(
+                        static_cast<int>(
+                            recommendationIndex
+                            )
+                    );
+
+                    RenderRecommendedOpportunity(
+                        recommendation
+                    );
+
+                    ImGui::PopID();
+
+                }
+            }
+        }
+
+        if (hasAccountTracked &&
+            characterSpecificTopCount > 0)
+        {
+            ImGui::Spacing();
+            ImGui::Separator();
+
+            ImGui::TextColored(
+                UBSpecialColor(),
+                "Character-specific opportunities"
+            );
+
+            ImGui::TextDisabled(
+                "Exact progress is only visible in the in-game "
+                "Achievements panel."
+            );
+
+            ImGui::Spacing();
+
+            for (int id : tabOpportunityIDs)
+            {
+                if (!IsCharacterAdventureGuideAchievement(id))
+                {
+                    continue;
+                }
+
+                ImGui::PushID(id);
+                RenderCharacterSpecificOpportunity(id);
+                ImGui::PopID();
+            }
+        }
+
+        ImGui::Spacing();
+
+        // If every visible opportunity is character-specific, the top
+        // section already shows the complete list. Do not duplicate it.
+        const bool showAllMapOpportunities =
+            hasAccountTracked;
+
+        if (showAllMapOpportunities)
+        {
+            ImGui::Separator();
+        }
+
+        if (showAllMapOpportunities &&
+            ImGui::CollapsingHeader(
+                masteryTab
+                ? "All account-tracked mastery points"
+                : "All account-tracked achievements"))
+        {
+            if (ImGui::BeginChild(
+                "##CurrentMapOpportunityList",
+                ImVec2(0.0f, 260.0f),
+                true))
+            {
+                if (almostDoneCount > 0)
+                {
+                    ImGui::TextColored(
+                        UBSuccessColor(),
+                        "Almost Done"
+                    );
+
+                    for (int id : tabOpportunityIDs)
+                    {
+                        const double ratio =
+                            GetAchievementProgressRatio(id);
+
+                        if (ratio < 0.75)
+                        {
+                            continue;
+                        }
+
+                        RenderOpportunityRow(id);
+                    }
+
+                    ImGui::Spacing();
+                }
+
+                if (inProgressCount > 0)
+                {
+                    ImGui::TextColored(
+                        UBWarningColor(),
+                        "In Progress"
+                    );
+
+                    for (int id : tabOpportunityIDs)
+                    {
+                        const AchievementProgress* progress =
+                            FindAchievementProgress(id);
+
+                        if (progress == nullptr)
+                        {
+                            continue;
+                        }
+
+                        const double ratio =
+                            GetAchievementProgressRatio(id);
+
+                        if (ratio >= 0.75)
+                        {
+                            continue;
+                        }
+
+                        RenderOpportunityRow(id);
+                    }
+
+                    ImGui::Spacing();
+                }
+
+                if (notStartedCount > 0)
+                {
+                    ImGui::TextColored(
+                        UBDangerColor(),
+                        "Not Started"
+                    );
+
+                    for (int id : tabOpportunityIDs)
+                    {
+                        if (IsCharacterAdventureGuideAchievement(id))
+                        {
+                            continue;
+                        }
+
+                        if (FindAchievementProgress(id) != nullptr)
+                        {
+                            continue;
+                        }
+
+                        RenderOpportunityRow(id);
+                    }
+
+                    ImGui::Spacing();
+                }
+
+                // Character-specific objectives are shown in their own
+                // dedicated section above and are intentionally not repeated here.
+
+                if (tabOpportunityIDs.empty())
+                {
+                    ImGui::TextDisabled(
+                        "No map opportunities found "
+                        "in this map category."
+                    );
+                }
+            }
+
+            ImGui::EndChild();
+        }
+    }
+    else
+    {
+        ImGui::TextDisabled(
+            "Loading current-map achievement details..."
+        );
+    }
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UBRenderColoredTabButton:
+///     Distinct, readable category tabs with vector icons. The icons are drawn
+///     with ImGui primitives so no external font or icon package is required.
+///----------------------------------------------------------------------------------------------------
+bool UBRenderColoredTabButton(
+    const char* aText,
+    const char* aId,
+    const char* aTooltip,
+    int aIcon,
+    bool aSelected,
+    const ImVec4& aAccent,
+    float aWidth)
+{
+    const float scale = ImGui::GetFontSize() / 13.0f;
+    const float height = 34.0f * scale;
+
+    const ImVec4 background = aSelected
+        ? ImVec4(aAccent.x * 0.35f + 0.055f,
+            aAccent.y * 0.35f + 0.055f,
+            aAccent.z * 0.35f + 0.055f, 1.0f)
+        : ImVec4(aAccent.x * 0.13f + 0.075f,
+            aAccent.y * 0.13f + 0.075f,
+            aAccent.z * 0.13f + 0.075f, 1.0f);
+    const ImVec4 hovered = ImVec4(
+        aAccent.x * 0.48f + 0.07f,
+        aAccent.y * 0.48f + 0.07f,
+        aAccent.z * 0.48f + 0.07f, 1.0f);
+    const ImVec4 active = ImVec4(
+        aAccent.x * 0.60f + 0.07f,
+        aAccent.y * 0.60f + 0.07f,
+        aAccent.z * 0.60f + 0.07f, 1.0f);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f * scale);
+    ImGui::PushStyleColor(ImGuiCol_Button, background);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hovered);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, active);
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        ImVec4(aAccent.x, aAccent.y, aAccent.z,
+            aSelected ? 0.95f : 0.45f));
+
+    const bool clicked = ImGui::Button(aId, ImVec2(aWidth, height));
+    const bool hoveredNow = ImGui::IsItemHovered();
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(2);
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImU32 ink = ImGui::GetColorU32(aSelected
+        ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
+        : ImVec4(0.84f, 0.87f, 0.94f, 1.0f));
+    const ImU32 iconInk = ImGui::GetColorU32(aSelected
+        ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
+        : aAccent);
+
+    const float cx = min.x + 18.0f * scale;
+    const float cy = (min.y + max.y) * 0.5f;
+    const float line = 1.65f * scale;
+
+    if (aIcon == 0) // Achievements: checked objective list.
+    {
+        draw->AddRect(
+            ImVec2(cx - 7.0f * scale, cy - 8.0f * scale),
+            ImVec2(cx + 7.0f * scale, cy + 8.0f * scale),
+            iconInk, 2.0f * scale, ImDrawCornerFlags_All, line);
+        draw->AddLine(ImVec2(cx - 4.5f * scale, cy - 2.0f * scale),
+            ImVec2(cx - 2.0f * scale, cy + 0.5f * scale), iconInk, line);
+        draw->AddLine(ImVec2(cx - 2.0f * scale, cy + 0.5f * scale),
+            ImVec2(cx + 4.0f * scale, cy - 4.0f * scale), iconInk, line);
+        draw->AddLine(ImVec2(cx - 4.0f * scale, cy + 4.0f * scale),
+            ImVec2(cx + 4.0f * scale, cy + 4.0f * scale), iconInk, line);
+    }
+    else if (aIcon == 1) // Masteries: faceted mastery crystal.
+    {
+        const ImVec2 diamond[4] = {
+            ImVec2(cx, cy - 9.0f * scale),
+            ImVec2(cx + 8.0f * scale, cy),
+            ImVec2(cx, cy + 9.0f * scale),
+            ImVec2(cx - 8.0f * scale, cy)
+        };
+        draw->AddPolyline(diamond, 4, iconInk, true, line);
+        draw->AddLine(ImVec2(cx, cy - 9.0f * scale),
+            ImVec2(cx, cy + 9.0f * scale), iconInk, line);
+        draw->AddLine(ImVec2(cx - 8.0f * scale, cy),
+            ImVec2(cx + 8.0f * scale, cy), iconInk, line);
+    }
+    else // Holiday: wrapped festival gift.
+    {
+        draw->AddRect(
+            ImVec2(cx - 8.0f * scale, cy - 3.0f * scale),
+            ImVec2(cx + 8.0f * scale, cy + 8.0f * scale),
+            iconInk, 1.0f * scale, ImDrawCornerFlags_All, line);
+        draw->AddRect(
+            ImVec2(cx - 9.0f * scale, cy - 6.0f * scale),
+            ImVec2(cx + 9.0f * scale, cy - 2.0f * scale),
+            iconInk, 1.0f * scale, ImDrawCornerFlags_All, line);
+        draw->AddLine(ImVec2(cx, cy - 6.0f * scale),
+            ImVec2(cx, cy + 8.0f * scale), iconInk, line);
+        draw->AddCircle(ImVec2(cx - 3.0f * scale, cy - 8.5f * scale),
+            3.0f * scale, iconInk, 8, line);
+        draw->AddCircle(ImVec2(cx + 3.0f * scale, cy - 8.5f * scale),
+            3.0f * scale, iconInk, 8, line);
+    }
+
+    const ImVec2 textSize = ImGui::CalcTextSize(aText);
+    draw->AddText(
+        ImVec2(min.x + 34.0f * scale,
+            (min.y + max.y - textSize.y) * 0.5f), ink, aText);
+
+    if (aSelected)
+    {
+        draw->AddRectFilled(
+            ImVec2(min.x + 7.0f * scale, max.y - 3.5f * scale),
+            ImVec2(max.x - 7.0f * scale, max.y - 1.5f * scale),
+            ImGui::GetColorU32(aAccent), 1.0f * scale);
+    }
+
+    if (hoveredNow)
+    {
+        ImGui::SetTooltip("%s", aTooltip);
+    }
+
+    return clicked;
+}
+
+///----------------------------------------------------------------------------------------------------
 /// AddonRender:
 ///----------------------------------------------------------------------------------------------------
 void AddonRender()
@@ -7858,6 +8811,7 @@ void AddonRender()
     UpdateCurrentMapDefinitionSync();
 
     UpdateFestivalScheduleSync();
+    ExpireFestivalAfterVerifiedWindow();
     UpdateFestivalDefinitionSync();
     MaybeRefreshFestivalSchedule();
 
@@ -7906,12 +8860,12 @@ void AddonRender()
     }
 
     ImGui::SetNextWindowSize(
-        ImVec2(620.0f, 540.0f),
+        ImVec2(840.0f, 720.0f),
         ImGuiCond_FirstUseEver
     );
 
     ImGui::SetNextWindowSizeConstraints(
-        ImVec2(460.0f, 340.0f),
+        ImVec2(580.0f, 380.0f),
         ImVec2(1200.0f, 1200.0f)
     );
 
@@ -7922,53 +8876,42 @@ void AddonRender()
             "Unfinished Business"
         );
         ImGui::SameLine();
-        ImGui::TextDisabled("v0.1.1");
+        ImGui::TextDisabled("v0.1.2");
 
         ImGui::Separator();
 
         if (MumbleLink != nullptr)
         {
-            ImGui::TextWrapped(
-                "%s",
-                currentMapName.c_str()
-            );
+            // Restore the original visual hierarchy: map name on its own line,
+            // then opportunity count and a compact coverage indicator.
+            ImGui::SetWindowFontScale(1.15f);
+            ImGui::TextWrapped("%s", currentMapName.c_str());
+            ImGui::SetWindowFontScale(1.0f);
 
             if (!currentOpportunityCategoryName.empty())
             {
-                ImGui::SameLine();
-                ImGui::TextDisabled(
-                    " | %llu opportunities",
+                ImGui::TextDisabled("%llu opportunities",
                     static_cast<unsigned long long>(
-                        currentMapOpportunityIDs.size()
-                        )
-                );
+                        currentMapOpportunityIDs.size()));
             }
 
             if (achievementCategoriesLoaded)
             {
-                ImGui::SameLine();
-                ImGui::TextDisabled("|");
-
-                ImGui::SameLine();
-                ImGui::TextColored(
-                    GetCoverageDisplayColor(),
-                    "Coverage: %s",
-                    GetCoverageDisplayLabel()
-                );
-
+                if (!currentOpportunityCategoryName.empty())
+                {
+                    ImGui::SameLine();
+                }
+                ImGui::TextColored(GetCoverageDisplayColor(),
+                    "Coverage: %s", GetCoverageDisplayLabel());
                 if (ImGui::IsItemHovered())
                 {
-                    ImGui::SetTooltip(
-                        "%s",
-                        GetCoverageTooltip()
-                    );
+                    ImGui::SetTooltip("%s", GetCoverageTooltip());
                 }
             }
 
             if (achievementSyncActive)
             {
-                ImGui::SameLine();
-                ImGui::TextDisabled(" | refreshing...");
+                ImGui::TextDisabled("Refreshing account progress...");
             }
         }
         else
@@ -7978,366 +8921,72 @@ void AddonRender()
 
         ImGui::Spacing();
 
-        if (!activeFestivalAvailable)
+        // Keep the map context visible while the category content scrolls.
+        ImGui::Separator();
+
+        // Three equally sized, color-coded tab buttons. Icons are vector-drawn
+        // so they remain visible even when the Nexus font lacks emoji glyphs.
+        static int activeCategoryTab = 0; // 0 Achievements, 1 Masteries, 2 Holiday
+        const float tabGap = 6.0f * (ImGui::GetFontSize() / 13.0f);
+        const float tabWidth = (ImGui::GetContentRegionAvail().x - tabGap * 2.0f) / 3.0f;
+
+        if (UBRenderColoredTabButton(
+            "Achievements", "##UBTabAchievements",
+            "Achievements available in this map", 0,
+            activeCategoryTab == 0,
+            ImVec4(0.34f, 0.71f, 1.0f, 1.0f), tabWidth))
         {
+            activeCategoryTab = 0;
+        }
+        ImGui::SameLine(0.0f, tabGap);
+        if (UBRenderColoredTabButton(
+            "Masteries", "##UBTabMasteries",
+            "Achievements rewarding mastery points", 1,
+            activeCategoryTab == 1,
+            ImVec4(0.75f, 0.57f, 1.0f, 1.0f), tabWidth))
+        {
+            activeCategoryTab = 1;
+        }
+        ImGui::SameLine(0.0f, tabGap);
+        if (UBRenderColoredTabButton(
+            "Holiday", "##UBTabHoliday",
+            "Seasonal festival achievements", 2,
+            activeCategoryTab == 2,
+            ImVec4(1.0f, 0.69f, 0.35f, 1.0f), tabWidth))
+        {
+            activeCategoryTab = 2;
+        }
+
+        ImGui::Spacing();
+
+        if (activeCategoryTab == 0)
+        {
+            ImGui::BeginChild("##AchievementsTabBody", ImVec2(0.0f, 0.0f), false);
+            UBRenderMapTab(false);
+            ImGui::EndChild();
+        }
+        else if (activeCategoryTab == 1)
+        {
+            ImGui::BeginChild("##MasteriesTabBody", ImVec2(0.0f, 0.0f), false);
             ImGui::TextDisabled(
-                "Festival detection: %s",
-                festivalScheduleStatus.c_str()
-            );
-        }
-
-        RenderActiveFestivalSection();
-
-        if (!apiKeyValid)
-        {
-            ImGui::TextWrapped(
-                "GW2 API access is not ready. Open Nexus Options -> "
-                "Unfinished Business to add or validate an API key."
-            );
-        }
-        else if (achievementSyncActive ||
-            achievementDefinitionSyncActive ||
-            achievementCategorySyncActive ||
-            currentMapDefinitionSyncActive)
-        {
-            ImGui::TextDisabled("Refreshing achievement data...");
-        }
-        else if (!achievementDataLoaded)
-        {
-            ImGui::TextDisabled("Waiting for achievement data...");
-        }
-        else if (!achievementCategoriesLoaded)
-        {
-            ImGui::TextWrapped(
-                "%s",
-                achievementCategoryStatus.c_str()
-            );
-        }
-        else if (currentOpportunityCategoryName.empty())
-        {
-            if (activeFestivalAvailable &&
-                currentOpportunityStatus ==
-                "No achievement mapping exists for this map yet.")
-            {
-                ImGui::TextWrapped(
-                    "No permanent map-specific achievement mapping "
-                    "exists for this map yet."
-                );
-            }
-            else
-            {
-                ImGui::TextWrapped(
-                    "%s",
-                    currentOpportunityStatus.c_str()
-                );
-            }
-
-            if (currentCoverageMode == MapCoverageMode::None &&
-                currentMapDefinitionsReady)
-            {
-                ImGui::Spacing();
-                ImGui::Separator();
-                RenderLimitedCoverageLeads();
-            }
-        }
-        else if (currentMapDefinitionsReady)
-        {
-            size_t almostDoneCount = 0;
-            size_t inProgressCount = 0;
-            size_t notStartedCount = 0;
-            size_t characterSpecificCount = 0;
-
-            CountCurrentMapOpportunityGroups(
-                almostDoneCount,
-                inProgressCount,
-                notStartedCount,
-                characterSpecificCount
-            );
-
-            ImGui::TextColored(
-                UBSuccessColor(),
-                "Almost done: %llu",
-                static_cast<unsigned long long>(almostDoneCount)
-            );
-
-            ImGui::SameLine();
-            ImGui::TextDisabled("|");
-
-            ImGui::SameLine();
-            ImGui::TextColored(
-                UBWarningColor(),
-                "In progress: %llu",
-                static_cast<unsigned long long>(inProgressCount)
-            );
-
-            ImGui::SameLine();
-            ImGui::TextDisabled("|");
-
-            ImGui::SameLine();
-            ImGui::TextColored(
-                UBDangerColor(),
-                "Not started: %llu",
-                static_cast<unsigned long long>(notStartedCount)
-            );
-
-            if (characterSpecificCount > 0)
-            {
-                ImGui::SameLine();
-                ImGui::TextDisabled("|");
-
-                ImGui::SameLine();
-                ImGui::TextColored(
-                    UBSpecialColor(),
-                    "Character-specific: %llu",
-                    static_cast<unsigned long long>(
-                        characterSpecificCount
-                        )
-                );
-            }
-
+                "Achievements in this map that reward mastery points.");
             ImGui::Spacing();
-            ImGui::Separator();
-
-            const size_t characterSpecificTopCount =
-                CountCharacterSpecificOpportunities();
-
-            const bool hasAccountTracked =
-                HasAccountTrackedOpportunities();
-
-            if (!hasAccountTracked &&
-                characterSpecificTopCount > 0)
-            {
-                ImGui::TextColored(
-                    UBSpecialColor(),
-                    "Character-specific opportunities in %s",
-                    currentOpportunityCategoryName.c_str()
-                );
-
-                ImGui::TextDisabled(
-                    "Exact progress is only visible in the in-game "
-                    "Achievements panel."
-                );
-
-                ImGui::Spacing();
-
-                for (int id : currentMapOpportunityIDs)
-                {
-                    if (!IsCharacterAdventureGuideAchievement(id))
-                    {
-                        continue;
-                    }
-
-                    OpportunityRecommendation opportunity =
-                        BuildRecommendation(id);
-
-                    ImGui::PushID(id);
-                    RenderRecommendedOpportunity(opportunity);
-                    ImGui::PopID();
-                }
-            }
-            else
-            {
-                ImGui::TextColored(
-                    UBAccentColor(),
-                    "Recommended in %s",
-                    currentOpportunityCategoryName.c_str()
-                );
-
-                ImGui::Spacing();
-
-                const std::vector<OpportunityRecommendation>
-                    recommendations =
-                    BuildCurrentMapRecommendations();
-
-                if (recommendations.empty())
-                {
-                    ImGui::TextDisabled(
-                        "No recommendations available."
-                    );
-                }
-                else
-                {
-                    for (size_t recommendationIndex = 0;
-                        recommendationIndex < recommendations.size();
-                        ++recommendationIndex)
-                    {
-                        const OpportunityRecommendation&
-                            recommendation =
-                            recommendations[recommendationIndex];
-
-                        ImGui::PushID(
-                            static_cast<int>(
-                                recommendationIndex
-                                )
-                        );
-
-                        RenderRecommendedOpportunity(
-                            recommendation
-                        );
-
-                        ImGui::PopID();
-
-                        if (recommendationIndex + 1 <
-                            recommendations.size())
-                        {
-                            ImGui::Separator();
-                        }
-                    }
-                }
-            }
-
-            if (hasAccountTracked &&
-                characterSpecificTopCount > 0)
-            {
-                ImGui::Spacing();
-                ImGui::Separator();
-
-                ImGui::TextColored(
-                    UBSpecialColor(),
-                    "Character-specific opportunities"
-                );
-
-                ImGui::TextDisabled(
-                    "Exact progress is only visible in the in-game "
-                    "Achievements panel."
-                );
-
-                ImGui::Spacing();
-
-                for (int id : currentMapOpportunityIDs)
-                {
-                    if (!IsCharacterAdventureGuideAchievement(id))
-                    {
-                        continue;
-                    }
-
-                    ImGui::PushID(id);
-                    RenderCharacterSpecificOpportunity(id);
-                    ImGui::PopID();
-                }
-            }
-
-            ImGui::Spacing();
-
-            // If every visible opportunity is character-specific, the top
-            // section already shows the complete list. Do not duplicate it.
-            const bool showAllMapOpportunities =
-                hasAccountTracked;
-
-            if (showAllMapOpportunities)
-            {
-                ImGui::Separator();
-            }
-
-            if (showAllMapOpportunities &&
-                ImGui::CollapsingHeader(
-                    "Account-tracked opportunities",
-                    ImGuiTreeNodeFlags_DefaultOpen))
-            {
-                if (ImGui::BeginChild(
-                    "##CurrentMapOpportunityList",
-                    ImVec2(0.0f, 300.0f),
-                    true))
-                {
-                    if (almostDoneCount > 0)
-                    {
-                        ImGui::TextColored(
-                            UBSuccessColor(),
-                            "Almost Done"
-                        );
-
-                        for (int id : currentMapOpportunityIDs)
-                        {
-                            const double ratio =
-                                GetAchievementProgressRatio(id);
-
-                            if (ratio < 0.75)
-                            {
-                                continue;
-                            }
-
-                            RenderOpportunityRow(id);
-                        }
-
-                        ImGui::Spacing();
-                    }
-
-                    if (inProgressCount > 0)
-                    {
-                        ImGui::TextColored(
-                            UBWarningColor(),
-                            "In Progress"
-                        );
-
-                        for (int id : currentMapOpportunityIDs)
-                        {
-                            const AchievementProgress* progress =
-                                FindAchievementProgress(id);
-
-                            if (progress == nullptr)
-                            {
-                                continue;
-                            }
-
-                            const double ratio =
-                                GetAchievementProgressRatio(id);
-
-                            if (ratio >= 0.75)
-                            {
-                                continue;
-                            }
-
-                            RenderOpportunityRow(id);
-                        }
-
-                        ImGui::Spacing();
-                    }
-
-                    if (notStartedCount > 0)
-                    {
-                        ImGui::TextColored(
-                            UBDangerColor(),
-                            "Not Started"
-                        );
-
-                        for (int id : currentMapOpportunityIDs)
-                        {
-                            if (IsCharacterAdventureGuideAchievement(id))
-                            {
-                                continue;
-                            }
-
-                            if (FindAchievementProgress(id) != nullptr)
-                            {
-                                continue;
-                            }
-
-                            RenderOpportunityRow(id);
-                        }
-
-                        ImGui::Spacing();
-                    }
-
-                    // Character-specific objectives are shown in their own
-                    // dedicated section above and are intentionally not repeated here.
-
-                    if (currentMapOpportunityIDs.empty())
-                    {
-                        ImGui::TextDisabled(
-                            "No map opportunities found "
-                            "in this map category."
-                        );
-                    }
-                }
-
-                ImGui::EndChild();
-            }
+            UBRenderMapTab(true);
+            ImGui::EndChild();
         }
         else
         {
-            ImGui::TextDisabled(
-                "Loading current-map achievement details..."
-            );
+            ImGui::BeginChild("##HolidayTabBody", ImVec2(0.0f, 0.0f), false);
+            if (activeFestivalAvailable)
+            {
+                RenderActiveFestivalSection();
+            }
+            else
+            {
+                ImGui::TextDisabled("No active festival detected.");
+                ImGui::TextWrapped("%s", festivalScheduleStatus.c_str());
+            }
+            ImGui::EndChild();
         }
     }
 
@@ -8440,7 +9089,7 @@ void RenderLimitedCoverageLeads()
                 }
             }
 
-            if (ImGui::SmallButton("Open Wiki"))
+            if (UBColoredActionButton("Open Wiki", UBActionButtonKind::Wiki))
             {
                 OpenAchievementInNexusGameWiki(
                     lead.Name.c_str()
@@ -8449,7 +9098,7 @@ void RenderLimitedCoverageLeads()
 
             ImGui::SameLine();
 
-            if (ImGui::SmallButton("Copy name"))
+            if (UBColoredActionButton("Copy name", UBActionButtonKind::CopyName))
             {
                 CopyAchievementName(
                     lead.Name.c_str()
@@ -8496,7 +9145,7 @@ void AddonOptions()
         UBAccentColor(),
         "Unfinished Business"
     );
-    ImGui::TextDisabled("Version 0.1.1");
+    ImGui::TextDisabled("Version 0.1.2");
     ImGui::Separator();
 
     ImGui::TextColored(

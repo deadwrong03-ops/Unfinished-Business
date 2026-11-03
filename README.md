@@ -52,3 +52,12 @@ If NexusGameWiki is unavailable, the addon falls back to copying the achievement
 Early development / testing build.
 
 Current version: `0.1.0`
+
+## What's New in v0.1.2
+
+- Redesigned achievement cards with progress bars and clearer summaries.
+- Added colored Achievements, Masteries, and Holiday tabs with icons.
+- Added mastery-point achievement filtering.
+- Added colored Open Wiki, Copy Name, Copy + Hero, and Ignore buttons.
+- Added offline festival-date fallback when the official calendar is unavailable.
+- Improved readability and reduced duplicate progress information.
