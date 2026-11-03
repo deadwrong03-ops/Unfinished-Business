@@ -1558,7 +1558,7 @@ bool HttpGetOnce(
         return false;
     }
 
-    WinHttpSetTimeouts(hSession, 3000, 3000, 3000, 5000);
+    WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 15000);
 
     HINTERNET hConnect = WinHttpConnect(
         hSession,
