@@ -7767,7 +7767,7 @@ void AddonLoad(AddonAPI_t* aApi)
     APIDefs->Log(
         LOGL_DEBUG,
         "Unfinished Business",
-        "Unfinished Business v0.1.0 loaded."
+        "Unfinished Business v0.1.1 loaded."
     );
 }
 
@@ -7922,7 +7922,7 @@ void AddonRender()
             "Unfinished Business"
         );
         ImGui::SameLine();
-        ImGui::TextDisabled("v0.1.0");
+        ImGui::TextDisabled("v0.1.1");
 
         ImGui::Separator();
 
@@ -8496,7 +8496,7 @@ void AddonOptions()
         UBAccentColor(),
         "Unfinished Business"
     );
-    ImGui::TextDisabled("Version 0.1.0");
+    ImGui::TextDisabled("Version 0.1.1");
     ImGui::Separator();
 
     ImGui::TextColored(
