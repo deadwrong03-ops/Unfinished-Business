@@ -2,9 +2,14 @@
 
 A Guild Wars 2 Nexus addon that discovers achievement opportunities relevant to your current map and helps you decide what to work on next.
 
-![Unfinished Business Screenshot 1](https://github.com/user-attachments/assets/0ff70126-cea3-4617-a6f4-ac9c525021aa)
+<img width="200" height="200" alt="Screenshot 2026-11-04 233930" src="https://github.com/user-attachments/assets/662f2c20-8a5a-459a-ac70-e1640191ce89" />
+<img width="200" height="200" alt="Screenshot 2026-11-04 234009" src="https://github.com/user-attachments/assets/1bc962c4-5223-45c1-9237-a6d229c8231c" />
+<img width="200" height="200" alt="Screenshot 2026-11-04 234038" src="https://github.com/user-attachments/assets/f7b9884d-806a-45a6-a346-1b1e6ba0fb22" />
+<img width="200" height="200" alt="Screenshot 2026-11-04 234104" src="https://github.com/user-attachments/assets/4943c991-18b5-47f6-9e5e-e73573e11d22" />
+<img width="200" height="200" alt="Screenshot 2026-11-04 234152" src="https://github.com/user-attachments/assets/5f349b35-4b10-4424-aeb0-eddc45316368" />
+<img width="200" height="200" alt="Screenshot 2026-11-04 234419" src="https://github.com/user-attachments/assets/edb6dee1-52b3-49b0-8505-3a4d1e1254f0" />
 
-![Unfinished Business Screenshot 2](https://github.com/user-attachments/assets/a7b1a6f6-829b-4d16-96c2-a49341747e25)
+
 
 ## Project Status
 
