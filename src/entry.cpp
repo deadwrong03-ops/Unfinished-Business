@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cstdint>
 #include <fstream>
@@ -62,7 +63,12 @@ const AchievementProgress* FindAchievementProgress(int aID);
 bool IsCharacterAdventureGuideAchievement(int aID);
 bool IsRetiredCategoryName(const std::string& aName);
 void BuildCurrentMapOpportunityList();
+bool UBContainsWholePhrase(const std::string& aText, const std::string& aPhrase);
 void SaveUserPreferences();
+ImVec4 UBAccentColor();
+ImVec4 UBSuccessColor();
+ImVec4 UBWarningColor();
+ImVec4 UBMutedInfoColor();
 void LoadUserPreferences();
 std::string ToLowerCopy(const std::string& aValue);
 
@@ -88,15 +94,49 @@ struct MapLookupResult
     uint32_t MapID = 0;
     bool Success = false;
     std::string Name;
+    std::string RegionName;
     std::string Error;
 };
 
 uint32_t lastObservedMapID = 0;
 uint32_t displayedMapID = 0;
 std::string currentMapName = "Waiting for map data...";
+std::string currentMapRegionName;
 
 bool mapLookupActive = false;
 std::future<MapLookupResult> mapLookupFuture;
+
+/* optional, public-only VPS map index state (v0.2.0 test) */
+struct UBVpsCandidate
+{
+    int ID = 0;
+    std::string Scope;       // "map" or "regional" only
+    std::string Confidence;
+    std::string Source;
+    std::string Evidence;
+};
+
+struct UBVpsLookupResult
+{
+    uint32_t MapID = 0;
+    bool Success = false;
+    bool Truncated = false;
+    std::vector<UBVpsCandidate> Candidates;
+    std::string Error;
+};
+
+bool ubVpsIndexEnabled = true;
+bool ubVpsLookupActive = false;
+bool ubVpsRescanPending = false;
+uint32_t ubVpsInFlightMapID = 0;
+size_t ubVpsMergedCount = 0;
+size_t ubVpsRegionalCount = 0;
+std::future<UBVpsLookupResult> ubVpsLookupFuture;
+std::unordered_map<uint32_t, UBVpsLookupResult> ubVpsCache;
+std::unordered_set<uint32_t> ubVpsAttemptedMaps;
+std::unordered_map<int, UBVpsCandidate> ubVpsCurrentCandidates;
+std::unordered_set<int> ubVpsOnlyCandidateIDs;
+std::string ubVpsStatus = "Waiting for map ID...";
 
 /* API key state */
 struct ApiKeyValidationResult
@@ -144,6 +184,51 @@ int achievementProgressProbeID = 6670;
 
 std::unordered_set<int> ignoredAchievementIDs;
 bool opportunityFiltersDirty = false;
+
+/* Wizard's Vault daily/weekly objectives: direct GW2 API, never the VPS. */
+struct UBVaultObjective
+{
+    int ID = 0;
+    std::string Title;
+    std::string Track;
+    int Acclaim = 0;
+    int Current = 0;
+    int Complete = 0;
+    bool Claimed = false;
+};
+
+struct UBVaultPeriod
+{
+    bool Loaded = false;
+    int MetaCurrent = 0;
+    int MetaComplete = 0;
+    int MetaAcclaim = 0;
+    bool MetaClaimed = false;
+    std::vector<UBVaultObjective> Objectives;
+    std::string Error;
+};
+
+struct UBVaultSyncResult
+{
+    UBVaultPeriod Daily;
+    UBVaultPeriod Weekly;
+    uint64_t Generation = 0;
+};
+
+UBVaultPeriod ubVaultDaily;
+UBVaultPeriod ubVaultWeekly;
+std::future<UBVaultSyncResult> ubVaultFuture;
+bool ubVaultSyncActive = false;
+bool ubVaultLastAttemptValid = false;
+bool ubVaultAnimateTab = true;
+// In-session visual test, does not change acknowledgement or saved settings.
+double ubVaultPulsePreviewUntil = 0.0;
+uint64_t ubVaultGeneration = 0;
+std::chrono::steady_clock::time_point ubVaultLastAttempt;
+std::string ubVaultStatus = "Waiting for validated GW2 API key...";
+std::string ubVaultAcknowledgedSignature;
+std::string ubVaultLatestSignature;
+constexpr int ubVaultRefreshSeconds = 300;
 
 /* achievement state */
 struct AchievementProgress
@@ -632,6 +717,7 @@ const std::vector<MapCategoryAlias> MapCategoryAliases =
 bool currentMapDefinitionSyncActive = false;
 bool currentMapDefinitionsReady = false;
 std::future<AchievementDefinitionSyncResult> currentMapDefinitionSyncFuture;
+std::string currentMapDefinitionRequestMap;
 
 std::string lastOpportunityMapName;
 std::string currentOpportunityCategoryName;
@@ -647,11 +733,20 @@ std::unordered_set<int> currentOpportunityDirectIDs;
 std::unordered_set<int> currentOpportunityTextFilteredIDs;
 std::vector<std::string> currentOpportunityMatchTerms;
 
+// v0.2 coverage discovery: exact map names are promoted only when they appear
+// explicitly in public achievement text or category names. Regional matches
+// are marked separately because the objective may be on another nearby map.
+std::unordered_set<int> currentOpportunityRegionalIDs;
+size_t currentAutoMapMatchCount = 0;
+size_t currentRegionalMatchCount = 0;
+bool currentDiscoveryScanComplete = false;
+
 enum class MapCoverageMode
 {
     None,
     ExactCategory,
-    CuratedMapping
+    CuratedMapping,
+    ContextualDiscovery
 };
 
 MapCoverageMode currentCoverageMode = MapCoverageMode::None;
@@ -998,7 +1093,10 @@ void SaveUserPreferences()
         << "prefer_started=" << (preferStartedAchievements ? 1 : 0) << "\n"
         << "prefer_mastery=" << (preferMasteryRewards ? 1 : 0) << "\n"
         << "prefer_ap=" << (preferAchievementPoints ? 1 : 0) << "\n"
-        << "auto_refresh=" << (autoRefreshAchievementProgress ? 1 : 0) << "\n";
+        << "auto_refresh=" << (autoRefreshAchievementProgress ? 1 : 0) << "\n"
+        << "vps_index_enabled=" << (ubVpsIndexEnabled ? 1 : 0) << "\n"
+        << "vault_animate=" << (ubVaultAnimateTab ? 1 : 0) << "\n"
+        << "vault_ack=" << ubVaultAcknowledgedSignature << "\n";
 
     file << "ignored=";
 
@@ -1108,6 +1206,18 @@ void LoadUserPreferences()
         {
             autoRefreshAchievementProgress =
                 ParsePreferenceBool(value);
+        }
+        else if (key == "vps_index_enabled")
+        {
+            ubVpsIndexEnabled = ParsePreferenceBool(value);
+        }
+        else if (key == "vault_animate")
+        {
+            ubVaultAnimateTab = ParsePreferenceBool(value);
+        }
+        else if (key == "vault_ack")
+        {
+            ubVaultAcknowledgedSignature = value;
         }
         else if (key == "ignored")
         {
@@ -1784,6 +1894,222 @@ bool HttpGet(
 
     return false;
 }
+
+// Wizard's Vault API (account + progression). Public VPS calls are separate;
+// the key is sent ONLY to api.guildwars2.com using the existing HttpGet client.
+UBVaultPeriod UBFetchVaultPeriod(
+    const std::wstring& aPath, const std::string& aApiKey)
+{
+    UBVaultPeriod period;
+    DWORD status = 0;
+    std::string response;
+    std::string error;
+    if (!HttpGet(aPath, aApiKey, status, response, error))
+    {
+        period.Error = error.empty() ? "GW2 API request failed." : error;
+        return period;
+    }
+    if (status != 200)
+    {
+        period.Error = "GW2 API returned HTTP " + std::to_string(status) + ".";
+        return period;
+    }
+
+    if (!ExtractJsonIntField(response, "meta_progress_current", period.MetaCurrent) ||
+        !ExtractJsonIntField(response, "meta_progress_complete", period.MetaComplete) ||
+        !ExtractJsonBoolField(response, "meta_reward_claimed", period.MetaClaimed))
+    {
+        period.Error = "Wizard's Vault response schema was not recognized.";
+        return period;
+    }
+    ExtractJsonIntField(response, "meta_reward_astral", period.MetaAcclaim);
+
+    const size_t key = response.find("\"objectives\"");
+    if (key == std::string::npos)
+    {
+        period.Error = "Wizard's Vault response has no objectives field.";
+        return period;
+    }
+    size_t start = response.find('[', key + 12);
+    if (start == std::string::npos)
+    {
+        period.Error = "Wizard's Vault objectives array is malformed.";
+        return period;
+    }
+
+    // Parse only top-level objective objects; honor quotes/escapes while
+    // locating boundaries to avoid confusing braces in objective titles.
+    bool inString = false;
+    bool escaped = false;
+    int objectDepth = 0;
+    size_t objectStart = std::string::npos;
+    bool foundArrayEnd = false;
+    for (size_t i = start + 1; i < response.size(); ++i)
+    {
+        const char ch = response[i];
+        if (inString)
+        {
+            if (escaped) escaped = false;
+            else if (ch == '\\') escaped = true;
+            else if (ch == '"') inString = false;
+            continue;
+        }
+        if (ch == '"') { inString = true; continue; }
+        if (ch == '{')
+        {
+            if (objectDepth++ == 0) objectStart = i;
+        }
+        else if (ch == '}' && objectDepth > 0)
+        {
+            if (--objectDepth == 0 && objectStart != std::string::npos)
+            {
+                const std::string item = response.substr(objectStart, i - objectStart + 1);
+                UBVaultObjective objective;
+                if (!ExtractJsonIntField(item, "id", objective.ID) ||
+                    objective.ID <= 0)
+                {
+                    period.Error = "Wizard's Vault objective is missing an ID.";
+                    return period;
+                }
+                objective.Title = ExtractJsonStringField(item, "title");
+                objective.Track = ExtractJsonStringField(item, "track");
+                ExtractJsonIntField(item, "acclaim", objective.Acclaim);
+                ExtractJsonIntField(item, "progress_current", objective.Current);
+                ExtractJsonIntField(item, "progress_complete", objective.Complete);
+                if (!ExtractJsonBoolField(item, "claimed", objective.Claimed) ||
+                    objective.Title.empty())
+                {
+                    period.Error = "Wizard's Vault objective schema was not recognized.";
+                    return period;
+                }
+                period.Objectives.push_back(std::move(objective));
+                objectStart = std::string::npos;
+                if (period.Objectives.size() > 50)
+                {
+                    period.Error = "Too many Wizard's Vault objectives returned.";
+                    return period;
+                }
+            }
+        }
+        else if (ch == ']' && objectDepth == 0)
+        {
+            foundArrayEnd = true;
+            break;
+        }
+    }
+    if (!foundArrayEnd)
+    {
+        period.Error = "Wizard's Vault objectives response was incomplete.";
+        return period;
+    }
+    period.Loaded = true;
+    return period;
+}
+
+int UBVaultPendingCount(const UBVaultPeriod& aPeriod)
+{
+    if (!aPeriod.Loaded) return 0;
+    int count = 0;
+    for (const UBVaultObjective& objective : aPeriod.Objectives)
+    {
+        // A completed, unclaimed task still merits an alert to claim its AA.
+        if (!objective.Claimed) ++count;
+    }
+    if (aPeriod.MetaComplete > 0 &&
+        aPeriod.MetaCurrent >= aPeriod.MetaComplete &&
+        !aPeriod.MetaClaimed) ++count;
+    return count;
+}
+
+std::string UBVaultSignature()
+{
+    if (!ubVaultDaily.Loaded && !ubVaultWeekly.Loaded) return {};
+    std::string signature;
+    auto append = [&](const char* label, const UBVaultPeriod& period)
+        {
+            if (!period.Loaded) return;
+            signature += label;
+            std::vector<int> ids;
+            for (const UBVaultObjective& objective : period.Objectives)
+                ids.push_back(objective.ID);
+            std::sort(ids.begin(), ids.end());
+            for (int id : ids) signature += std::to_string(id) + ".";
+            signature += ";";
+        };
+    append("D", ubVaultDaily);
+    append("W", ubVaultWeekly);
+    return signature;
+}
+
+void UBStartVaultSyncWithKey(const std::string& aKey)
+{
+    if (ubVaultSyncActive || aKey.empty()) return;
+    ubVaultSyncActive = true;
+    ubVaultLastAttemptValid = true;
+    ubVaultLastAttempt = std::chrono::steady_clock::now();
+    ubVaultStatus = "Updating Wizard's Vault objectives...";
+    const uint64_t generation = ubVaultGeneration;
+    std::string copy = aKey;
+    ubVaultFuture = std::async(std::launch::async,
+        [copy, generation]() mutable
+        {
+            UBVaultSyncResult result;
+            result.Generation = generation;
+            result.Daily = UBFetchVaultPeriod(
+                L"/v2/account/wizardsvault/daily?lang=en", copy);
+            result.Weekly = UBFetchVaultPeriod(
+                L"/v2/account/wizardsvault/weekly?lang=en", copy);
+            SecureClearString(copy);
+            return result;
+        });
+    SecureClearString(copy);
+}
+
+void UBStartVaultSync()
+{
+    if (!apiKeyValid || ubVaultSyncActive) return;
+    std::string key;
+    std::string error;
+    if (!LoadEncryptedApiKey(key, error))
+    {
+        ubVaultStatus = "Saved API key unavailable. Revalidate in options.";
+        ubVaultLastAttemptValid = true;
+        ubVaultLastAttempt = std::chrono::steady_clock::now();
+        SecureClearString(key);
+        return;
+    }
+    UBStartVaultSyncWithKey(key);
+    SecureClearString(key);
+}
+
+void UBUpdateVaultSync()
+{
+    if (!ubVaultSyncActive ||
+        ubVaultFuture.wait_for(std::chrono::milliseconds(0)) !=
+        std::future_status::ready) return;
+    UBVaultSyncResult result = ubVaultFuture.get();
+    ubVaultSyncActive = false;
+    if (!apiKeyValid || result.Generation != ubVaultGeneration)
+    {
+        ubVaultLastAttemptValid = false; // Schedule fresh account data next frame.
+        return;
+    }
+
+    // A failed refresh must not leave yesterday's objectives looking current.
+    ubVaultDaily = std::move(result.Daily);
+    ubVaultWeekly = std::move(result.Weekly);
+    ubVaultStatus = (ubVaultDaily.Loaded && ubVaultWeekly.Loaded)
+        ? "Dailies and weeklies synced."
+        : (ubVaultDaily.Loaded || ubVaultWeekly.Loaded)
+        ? "One Wizard's Vault period available; other request failed."
+        : "Wizard's Vault sync failed. Check API permissions or retry.";
+    ubVaultLatestSignature = UBVaultSignature();
+}
+
+// Vault rendering is defined after the shared card and progress helpers so
+// Daily + Weekly uses the same styling as the Achievements tab.
+void UBRenderVaultPeriod(const char* aTitle, const UBVaultPeriod& aPeriod);
+void UBRenderVaultTab();
 
 ///----------------------------------------------------------------------------------------------------
 /// ForumHttpGetOnce:
@@ -3072,6 +3398,7 @@ MapLookupResult LookupMapName(uint32_t aMapID)
     }
 
     result.Name = ExtractJsonStringField(response, "name");
+    result.RegionName = ExtractJsonStringField(response, "region_name");
 
     if (result.Name.empty())
     {
@@ -3439,6 +3766,257 @@ std::vector<std::string> SplitTopLevelObjects(const std::string& aJson)
     }
 
     return objects;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UBFetchPublicVpsIndex:
+///     GETs only a public map ID. No GW2 key, Authorization header,
+///     account identity, character name, or account progress is sent here.
+///     WinHTTP performs its normal HTTPS certificate validation.
+///----------------------------------------------------------------------------------------------------
+UBVpsLookupResult UBFetchPublicVpsIndex(uint32_t aMapID)
+{
+    UBVpsLookupResult result;
+    result.MapID = aMapID;
+
+    if (aMapID == 0)
+    {
+        result.Error = "No map ID available.";
+        return result;
+    }
+
+    HINTERNET session = WinHttpOpen(
+        L"UnfinishedBusiness/0.2 (public map index)",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+
+    if (!session)
+    {
+        result.Error = "Could not open VPS HTTP session.";
+        return result;
+    }
+
+    WinHttpSetTimeouts(session, 3000, 3000, 3000, 8000);
+
+    HINTERNET connection = WinHttpConnect(
+        session, L"copperclaw-api.duckdns.org",
+        INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!connection)
+    {
+        result.Error = "Could not connect to public VPS index.";
+        WinHttpCloseHandle(session);
+        return result;
+    }
+
+    // The sole variable in the URL is the decimal public map ID.
+    const std::wstring path = L"/ub/v1/maps/" +
+        std::to_wstring(aMapID) + L"/achievements";
+    HINTERNET request = WinHttpOpenRequest(
+        connection, L"GET", path.c_str(), nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+
+    if (!request)
+    {
+        result.Error = "Could not create public VPS request.";
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        return result;
+    }
+
+    std::string response;
+    DWORD status = 0;
+    bool transportOK = false;
+    const BOOL sent = WinHttpSendRequest(
+        request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (sent && WinHttpReceiveResponse(request, nullptr))
+    {
+        DWORD statusBytes = sizeof(status);
+        if (WinHttpQueryHeaders(request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusBytes,
+            WINHTTP_NO_HEADER_INDEX) && status == 200)
+        {
+            transportOK = true;
+            constexpr size_t maxJsonBytes = 1024 * 1024;
+            for (;;)
+            {
+                DWORD available = 0;
+                if (!WinHttpQueryDataAvailable(request, &available))
+                {
+                    transportOK = false;
+                    break;
+                }
+                if (available == 0)
+                {
+                    break;
+                }
+                if (response.size() + static_cast<size_t>(available) >
+                    maxJsonBytes)
+                {
+                    result.Error = "VPS response exceeded the size limit.";
+                    transportOK = false;
+                    break;
+                }
+                std::string chunk(available, '\0');
+                DWORD received = 0;
+                if (!WinHttpReadData(request, &chunk[0], available, &received))
+                {
+                    transportOK = false;
+                    break;
+                }
+                if (received == 0)
+                {
+                    transportOK = false;
+                    break;
+                }
+                chunk.resize(received);
+                response += chunk;
+            }
+        }
+    }
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+
+    if (!transportOK)
+    {
+        if (result.Error.empty())
+        {
+            result.Error = status != 0
+                ? "VPS index returned HTTP " + std::to_string(status) + "."
+                : "Public VPS index request failed.";
+        }
+        return result;
+    }
+
+    // Validate the schema and map identity before accepting public candidates.
+    int schema = 0;
+    int responseMapID = 0;
+    if (!ExtractJsonIntField(response, "schema_version", schema) || schema != 1)
+    {
+        result.Error = "Unexpected public VPS index schema.";
+        return result;
+    }
+    const size_t mapKey = response.find("\"map\"");
+    const size_t mapClose = mapKey != std::string::npos
+        ? response.find('}', mapKey) : std::string::npos;
+    if (mapClose == std::string::npos ||
+        !ExtractJsonIntField(response.substr(mapKey, mapClose - mapKey + 1),
+            "id", responseMapID) ||
+        responseMapID <= 0 || static_cast<uint32_t>(responseMapID) != aMapID)
+    {
+        result.Error = "VPS returned an unexpected map ID.";
+        return result;
+    }
+
+    const std::string candidatesArray =
+        ExtractJsonArraySection(response, "candidates");
+    if (candidatesArray.empty())
+    {
+        result.Error = "Public VPS candidate list was missing.";
+        return result;
+    }
+
+    std::unordered_set<int> seen;
+    for (const std::string& object : SplitTopLevelObjects(candidatesArray))
+    {
+        UBVpsCandidate candidate;
+        if (!ExtractJsonIntField(object, "id", candidate.ID) ||
+            candidate.ID <= 0 || !seen.insert(candidate.ID).second)
+        {
+            continue;
+        }
+        candidate.Scope = ExtractJsonStringField(object, "scope");
+        if (candidate.Scope != "map" && candidate.Scope != "regional")
+        {
+            continue;
+        }
+        candidate.Confidence = ExtractJsonStringField(object, "confidence");
+        candidate.Source = ExtractJsonStringField(object, "source");
+        candidate.Evidence = ExtractJsonStringField(object, "evidence");
+        result.Candidates.push_back(std::move(candidate));
+        if (result.Candidates.size() >= 200)
+        {
+            break;
+        }
+    }
+
+    ExtractJsonBoolField(response, "truncated", result.Truncated);
+    result.Success = true;
+    return result;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UBUpdatePublicVpsIndex:
+///     All state mutations occur on the render thread after async completion.
+///     A map change never applies an old response to the new map.
+///----------------------------------------------------------------------------------------------------
+void UBUpdatePublicVpsIndex()
+{
+    const uint32_t mapID = MumbleLink ? MumbleLink->Context.MapID : 0;
+
+    if (ubVpsLookupActive && ubVpsLookupFuture.valid() &&
+        ubVpsLookupFuture.wait_for(std::chrono::milliseconds(0)) ==
+        std::future_status::ready)
+    {
+        UBVpsLookupResult completed = ubVpsLookupFuture.get();
+        ubVpsLookupActive = false;
+        ubVpsInFlightMapID = 0;
+        if (completed.Success)
+        {
+            const uint32_t completedMap = completed.MapID;
+            ubVpsCache[completedMap] = std::move(completed);
+            if (ubVpsIndexEnabled && completedMap == mapID)
+            {
+                ubVpsRescanPending = true;
+            }
+        }
+        else if (completed.MapID == mapID)
+        {
+            ubVpsStatus = completed.Error.empty()
+                ? "VPS index unavailable; local scan continues."
+                : completed.Error + " Local scan continues.";
+        }
+    }
+
+    if (!ubVpsIndexEnabled)
+    {
+        ubVpsStatus = "Off (local scan only).";
+        return;
+    }
+    if (mapID == 0)
+    {
+        ubVpsStatus = "Waiting for a public map ID...";
+        return;
+    }
+    auto cached = ubVpsCache.find(mapID);
+    if (cached != ubVpsCache.end())
+    {
+        ubVpsStatus = "Loaded public map index (candidate data, not proof).";
+        return;
+    }
+    if (ubVpsLookupActive)
+    {
+        ubVpsStatus = "Loading public map index in background...";
+        return;
+    }
+    if (ubVpsAttemptedMaps.count(mapID) != 0)
+    {
+        // Do not retry a failing public endpoint every frame.
+        ubVpsStatus = "VPS index unavailable for this map; local scan continues.";
+        return;
+    }
+
+    ubVpsAttemptedMaps.insert(mapID);
+    ubVpsLookupActive = true;
+    ubVpsInFlightMapID = mapID;
+    ubVpsStatus = "Loading public map index in background...";
+    ubVpsLookupFuture = std::async(std::launch::async,
+        [mapID]() { return UBFetchPublicVpsIndex(mapID); });
 }
 
 ///----------------------------------------------------------------------------------------------------
@@ -3866,8 +4444,8 @@ void StartAchievementDefinitionSync()
 
     achievementDefinitionSyncActive = true;
     achievementDefinitionsLoaded = false;
-    achievementDefinitionsLoadedCount = 0;
-    achievementDefinitions.clear();
+    achievementDefinitionsLoadedCount = achievementDefinitions.size();
+    // Keep the public definitions already loaded by a map/festival sync.
     achievementDefinitionStatus =
         "Loading unfinished achievement definitions...";
 
@@ -3911,9 +4489,16 @@ void UpdateAchievementDefinitionSync()
         return;
     }
 
-    achievementDefinitions = std::move(result.Definitions);
-    achievementDefinitionsLoadedCount = result.DefinitionsLoaded;
+    // Merge instead of replacing: a map/festival request may have added
+    // definitions while the account-wide download was running.
+    for (auto& pair : result.Definitions)
+    {
+        achievementDefinitions[pair.first] = std::move(pair.second);
+    }
+    achievementDefinitionsLoadedCount = achievementDefinitions.size();
     achievementDefinitionsLoaded = true;
+    // Re-evaluate the live map for newly discovered text references.
+    lastOpportunityMapName.clear();
 
     const size_t missingDefinitions =
         achievementInProgress > achievementDefinitionsLoadedCount
@@ -4444,81 +5029,124 @@ bool IsContextualMapOpportunity(int aID)
 }
 
 ///----------------------------------------------------------------------------------------------------
+/// UBMapLeadKind:
+///     Location evidence and account progress are independent. An achievement
+///     mentioning a region is NOT evidence it can be completed on this map.
+///     Character Adventure Guide progress is per-character and unavailable
+///     through the account achievement API.
+///----------------------------------------------------------------------------------------------------
+enum class UBMapLeadKind
+{
+    OnMap,
+    Regional,
+    CharacterSpecific
+};
+
+UBMapLeadKind UBClassifyMapLead(int aID)
+{
+    if (IsCharacterAdventureGuideAchievement(aID))
+    {
+        return UBMapLeadKind::CharacterSpecific;
+    }
+
+    if (currentOpportunityDirectIDs.count(aID) > 0)
+    {
+        return UBMapLeadKind::OnMap;
+    }
+
+    const auto found = achievementDefinitions.find(aID);
+    if (found != achievementDefinitions.end() &&
+        !currentMapName.empty())
+    {
+        const AchievementDefinition& definition = found->second;
+        const std::string haystack = ToLowerCopy(
+            definition.Name + " " + definition.Description + " " +
+            definition.Requirement);
+
+        if (UBContainsWholePhrase(haystack, ToLowerCopy(currentMapName)))
+        {
+            return UBMapLeadKind::OnMap;
+        }
+    }
+
+    // Includes curated regional aliases (e.g. Ruins of Orr) which the old
+    // scanner incorrectly counted as locally actionable.
+    return UBMapLeadKind::Regional;
+}
+
+const char* UBGetOpportunitySourceLabel(int aID)
+{
+    auto vps = ubVpsCurrentCandidates.find(aID);
+    if (vps != ubVpsCurrentCandidates.end())
+    {
+        if (ubVpsOnlyCandidateIDs.count(aID) == 0)
+        {
+            return "Local scan + VPS public candidate index";
+        }
+        if (vps->second.Scope == "regional")
+        {
+            return "VPS public regional lead (not verified on this map)";
+        }
+        return "VPS public map candidate (not a verified task)";
+    }
+
+    const UBMapLeadKind kind = UBClassifyMapLead(aID);
+    if (kind == UBMapLeadKind::CharacterSpecific)
+    {
+        return "Character-specific lead (progress unavailable)";
+    }
+    if (kind == UBMapLeadKind::Regional)
+    {
+        return "Regional lead (not verified on this map)";
+    }
+    return currentOpportunityDirectIDs.count(aID) > 0
+        ? "Map category / curated mapping"
+        : "Explicit map reference";
+}
+
+///----------------------------------------------------------------------------------------------------
 /// GetOpportunityReason:
 ///----------------------------------------------------------------------------------------------------
 std::string GetOpportunityReason(int aID)
 {
-    const AchievementProgress* progress =
-        FindAchievementProgress(aID);
+    const AchievementProgress* progress = FindAchievementProgress(aID);
+    const UBMapLeadKind kind = UBClassifyMapLead(aID);
 
-    const bool contextual =
-        IsContextualMapOpportunity(aID);
-
-    if (IsCharacterAdventureGuideAchievement(aID))
+    if (kind == UBMapLeadKind::CharacterSpecific)
     {
-        if (contextual)
-        {
-            return
-                "Character Adventure Guide objective matched through a broader "
-                "category because its public text references " +
-                currentMapName +
-                ". Progress is character-specific and is not exposed by the "
-                "Guild Wars 2 API.";
-        }
-
-        return
-            "Character Adventure Guide objective relevant to this map. "
-            "Progress is character-specific and is not exposed by the "
-            "Guild Wars 2 API.";
+        return "Potential Character Adventure Guide objective. Your "
+            "character's progress is not available from the GW2 API; "
+            "check the in-game Achievements panel. Map relevance does not "
+            "verify that this character still needs the objective.";
     }
+
+    if (kind == UBMapLeadKind::Regional)
+    {
+        return "Regional lead associated with " + currentMapRegionName +
+            ". The objective may be on another map. This is not a "
+            "confirmed current-map task.";
+    }
+
+    const bool direct = currentOpportunityDirectIDs.count(aID) > 0;
+    const std::string evidence = direct
+        ? "Matched a map-specific or curated achievement category. "
+        : "The public achievement text explicitly mentions " +
+        currentMapName + ". ";
 
     if (progress == nullptr)
     {
-        if (contextual)
-        {
-            return
-                "Matched through a broader achievement category because "
-                "its public text explicitly references " +
-                currentMapName +
-                ", and there is no recorded account progress yet.";
-        }
-
-        return
-            "Belongs directly to the current map's achievement category and "
-            "has no recorded account progress yet.";
+        return evidence + "No account progress is recorded; unlock "
+            "requirements and availability have not been verified.";
     }
 
-    const double ratio =
-        GetAchievementProgressRatio(aID);
-
-    if (ratio >= 0.75)
+    if (GetAchievementProgressRatio(aID) >= 0.75)
     {
-        if (contextual)
-        {
-            return
-                "Matched through a broader achievement category because "
-                "its public text explicitly references " +
-                currentMapName +
-                ", and it is at least 75% complete.";
-        }
-
-        return
-            "Belongs directly to the current map's achievement category and "
-            "is at least 75% complete.";
+        return evidence + "The account reports at least 75% progress. "
+            "Exact completion location may still depend on the objective.";
     }
 
-    if (contextual)
-    {
-        return
-            "Matched through a broader achievement category because "
-            "its public text explicitly references " +
-            currentMapName +
-            ", and it has unfinished account progress.";
-    }
-
-    return
-        "Belongs directly to the current map's achievement category and "
-        "has unfinished account progress.";
+    return evidence + "The account has recorded unfinished progress. "
+        "Exact completion location may still depend on the objective.";
 }
 
 ///----------------------------------------------------------------------------------------------------
@@ -4659,6 +5287,143 @@ std::string GetActionabilityLabel(int aID)
         InferOpportunityMetadata(aID);
 
     return metadata.Tag;
+}
+
+// Availability is intentionally distinct from location evidence. The public
+// GW2 achievement and map APIs do not prove that an achievement is unlocked,
+// currently active or obtainable on this account.
+enum class UBAvailabilityStatus
+{
+    PermanentLead,
+    EventDependent,
+    Historical,
+    Unverified
+};
+
+struct UBAvailabilityInfo
+{
+    UBAvailabilityStatus Status = UBAvailabilityStatus::Unverified;
+    const char* Label = "Unverified";
+    const char* Explanation =
+        "Public map evidence alone does not establish current availability.";
+};
+
+UBAvailabilityInfo UBGetAvailability(int aID)
+{
+    // Curated historical family confirmed by the GW2 Wiki's historical
+    // Champion Rush and Bonus Events pages. ID 4892 is the Kryta example.
+    const auto definitionIt = achievementDefinitions.find(aID);
+    const AchievementDefinition* definition =
+        definitionIt == achievementDefinitions.end() ? nullptr : &definitionIt->second;
+    const std::string name = definition ? ToLowerCopy(definition->Name) : "";
+    if (aID == 4892 ||
+        name.find("bonus event: daily champion rush") == 0)
+    {
+        return { UBAvailabilityStatus::Historical, "Historical / unavailable",
+            "Legacy Champion Rush bonus achievement. The GW2 Wiki marks "
+            "this event family as historical; do not treat its map text "
+            "as an active objective." };
+    }
+
+    bool foundCategory = false;
+    bool historicalCategory = false;
+    bool limitedTimeCategory = false;
+    for (const AchievementCategory& category : achievementCategories)
+    {
+        if (std::find(category.AchievementIDs.begin(),
+            category.AchievementIDs.end(), aID) == category.AchievementIDs.end())
+        {
+            continue;
+        }
+        foundCategory = true;
+        const std::string categoryName = ToLowerCopy(category.Name);
+        if (IsRetiredCategoryName(category.Name))
+        {
+            historicalCategory = true;
+        }
+        if (categoryName.find("bonus event") != std::string::npos ||
+            categoryName.find("rush") != std::string::npos ||
+            categoryName.find("festival") != std::string::npos ||
+            categoryName.find("daily") == 0 ||
+            categoryName.find("weekly") == 0)
+        {
+            limitedTimeCategory = true;
+        }
+    }
+    if (historicalCategory)
+    {
+        return { UBAvailabilityStatus::Historical, "Historical / unavailable",
+            "Listed under a historical or retired achievement category. "
+            "Hidden from normal map recommendations." };
+    }
+    if (name.find("bonus event:") == 0 || limitedTimeCategory)
+    {
+        return { UBAvailabilityStatus::EventDependent, "Event-dependent",
+            "This is associated with a time-limited event or rotating "
+            "category. The addon has not verified that it is currently active." };
+    }
+    if (IsCharacterAdventureGuideAchievement(aID))
+    {
+        return { UBAvailabilityStatus::Unverified, "Character progress unverified",
+            "The public account API does not expose this character's "
+            "Adventure Guide status. Check the Hero panel." };
+    }
+    if (UBClassifyMapLead(aID) == UBMapLeadKind::Regional)
+    {
+        return { UBAvailabilityStatus::Unverified, "Regional / unverified",
+            "A regional reference is not proof of an objective on this map." };
+    }
+    if (!definition)
+    {
+        return { UBAvailabilityStatus::Unverified, "Unverified",
+            "Achievement definition is missing; cannot determine availability." };
+    }
+    const OpportunityMetadata metadata = InferOpportunityMetadata(aID);
+    if (metadata.Actionability == OpportunityActionability::Event)
+    {
+        return { UBAvailabilityStatus::EventDependent, "Event-dependent",
+            "Requires an in-game event. Map association is known, but the "
+            "event's live state and achievement eligibility are not verified." };
+    }
+    if (!foundCategory || definition->Requirement.empty())
+    {
+        return { UBAvailabilityStatus::Unverified, "Unverified",
+            "Not enough public category or requirement evidence to infer "
+            "whether the objective can currently be completed." };
+    }
+    return { UBAvailabilityStatus::PermanentLead, "Permanent lead (likely)",
+        "A non-seasonal map match with a published requirement. This is "
+        "a likely ongoing objective, NOT proof that this account has "
+        "unlocked it or that it is currently obtainable." };
+}
+
+void UBRenderAvailability(int aID, bool aShowExplanation)
+{
+    const UBAvailabilityInfo available = UBGetAvailability(aID);
+    ImVec4 color = UBMutedInfoColor();
+    switch (available.Status)
+    {
+    case UBAvailabilityStatus::PermanentLead:
+        color = UBSuccessColor();
+        break;
+    case UBAvailabilityStatus::EventDependent:
+        color = UBWarningColor();
+        break;
+    case UBAvailabilityStatus::Historical:
+        color = ImVec4(0.95f, 0.48f, 0.42f, 1.0f);
+        break;
+    case UBAvailabilityStatus::Unverified:
+        break;
+    }
+    ImGui::TextColored(color, "Availability: %s", available.Label);
+    if (aShowExplanation)
+    {
+        ImGui::TextWrapped("Availability evidence: %s", available.Explanation);
+    }
+    else if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("%s", available.Explanation);
+    }
 }
 
 ///----------------------------------------------------------------------------------------------------
@@ -4915,7 +5680,7 @@ OpportunityRecommendation BuildRecommendation(int aID)
         if (recommendation.Reasons.empty())
         {
             recommendation.Reasons.push_back(
-                "available on this map"
+                "No account progress recorded"
             );
         }
     }
@@ -5226,35 +5991,39 @@ struct UBVisualCard
     ImVec2 Start = ImVec2(0.0f, 0.0f);
     float Width = 0.0f;
     bool Subtle = false;
+    bool Compact = false;
 };
 
-void UBBeginVisualCard(UBVisualCard& aCard, bool aSubtle = false)
+void UBBeginVisualCard(UBVisualCard& aCard, bool aSubtle = false,
+    bool aCompact = false)
 {
     const float scale = UBPresentationScale();
     aCard.Start = ImGui::GetCursorScreenPos();
     aCard.Width = ImGui::GetContentRegionAvail().x;
     aCard.Subtle = aSubtle;
+    aCard.Compact = aCompact;
     aCard.DrawList = ImGui::GetWindowDrawList();
     aCard.Splitter.Split(aCard.DrawList, 2);
     aCard.Splitter.SetCurrentChannel(aCard.DrawList, 1);
 
     ImGui::BeginGroup();
-    ImGui::Dummy(ImVec2(0.0f, 5.0f * scale));
-    ImGui::Indent(11.0f * scale);
+    ImGui::Dummy(ImVec2(0.0f, (aCompact ? 2.5f : 5.0f) * scale));
+    ImGui::Indent((aCompact ? 9.0f : 11.0f) * scale);
 }
 
 void UBEndVisualCard(UBVisualCard& aCard)
 {
     const float scale = UBPresentationScale();
-    ImGui::Unindent(11.0f * scale);
-    ImGui::Dummy(ImVec2(0.0f, 6.0f * scale));
+    ImGui::Unindent((aCard.Compact ? 9.0f : 11.0f) * scale);
+    ImGui::Dummy(ImVec2(0.0f, (aCard.Compact ? 3.0f : 6.0f) * scale));
     ImGui::EndGroup();
 
     const ImVec2 bottom = ImGui::GetItemRectMax();
     float bottomY = bottom.y;
-    if (bottomY < aCard.Start.y + 28.0f * scale)
+    const float minHeight = aCard.Compact ? 22.0f : 28.0f;
+    if (bottomY < aCard.Start.y + minHeight * scale)
     {
-        bottomY = aCard.Start.y + 28.0f * scale;
+        bottomY = aCard.Start.y + minHeight * scale;
     }
 
     aCard.Splitter.SetCurrentChannel(aCard.DrawList, 0);
@@ -5278,7 +6047,7 @@ void UBEndVisualCard(UBVisualCard& aCard)
 
     aCard.Splitter.SetCurrentChannel(aCard.DrawList, 1);
     aCard.Splitter.Merge(aCard.DrawList);
-    ImGui::Dummy(ImVec2(0.0f, 4.0f * scale));
+    ImGui::Dummy(ImVec2(0.0f, (aCard.Compact ? 2.0f : 4.0f) * scale));
 }
 
 void UBRenderThinProgressBar(double aRatio)
@@ -5311,6 +6080,244 @@ void UBRenderThinProgressBar(double aRatio)
     ImGui::Dummy(ImVec2(width, height));
 }
 
+// Wizard's Vault cards deliberately reuse the achievement card backdrop,
+// padding, and outline.  The progress strip adds status-specific color.
+// Daily/Weekly shares the Achievements card frame but uses compact spacing.
+// The regular achievement cards are not affected.
+void UBRenderVaultProgressStrip(double aRatio, const ImVec4& aColor)
+{
+    const float scale = UBPresentationScale();
+    const float width = ImGui::GetContentRegionAvail().x - 5.0f * scale;
+    if (width <= 0.0f) return;
+
+    const float fraction = static_cast<float>((std::max)(0.0,
+        (std::min)(1.0, aRatio)));
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const float height = 4.0f * scale;
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(pos,
+        ImVec2(pos.x + width, pos.y + height),
+        ImGui::GetColorU32(ImVec4(0.24f, 0.29f, 0.36f, 0.90f)),
+        2.0f * scale);
+    if (fraction > 0.0f)
+    {
+        drawList->AddRectFilled(pos,
+            ImVec2(pos.x + width * fraction, pos.y + height),
+            ImGui::GetColorU32(aColor), 2.0f * scale);
+    }
+    ImGui::Dummy(ImVec2(width, height));
+}
+
+// Draw one objective in the same card theme as the Achievements tab.
+// Its collapsed state is two text lines plus a thin progress strip.
+void UBRenderVaultObjectiveCard(const UBVaultObjective& objective)
+{
+    ImGui::PushID(objective.ID);
+    const int current = (std::max)(0, objective.Current);
+    const int maximum = (std::max)(0, objective.Complete);
+    const bool ready = !objective.Claimed && maximum > 0 &&
+        current >= maximum;
+    const double ratio = maximum > 0
+        ? (std::min)(1.0, static_cast<double>(current) /
+            static_cast<double>(maximum)) : 0.0;
+    const ImVec4 color = objective.Claimed ? UBSuccessColor()
+        : ready ? UBWarningColor() : UBAccentColor();
+
+    UBVisualCard card;
+    UBBeginVisualCard(card, objective.Claimed, true);
+    const std::string label = objective.Title + "##vault_objective";
+    const bool expanded = ImGui::TreeNodeEx(label.c_str(),
+        ImGuiTreeNodeFlags_SpanAvailWidth);
+
+    if (objective.Claimed)
+        ImGui::TextColored(UBSuccessColor(), "Claimed  |  %d Astral Acclaim",
+            objective.Acclaim);
+    else if (ready)
+        ImGui::TextColored(UBWarningColor(), "Reward ready to claim  |  %d Astral Acclaim",
+            objective.Acclaim);
+    else
+        ImGui::TextColored(UBMutedInfoColor(), "%d/%d progress  |  %d Astral Acclaim  |  %s",
+            current, maximum, objective.Acclaim,
+            objective.Track.empty() ? "Wizard's Vault" : objective.Track.c_str());
+    UBRenderVaultProgressStrip(ratio, color);
+
+    if (expanded)
+    {
+        ImGui::Indent();
+        ImGui::Spacing();
+        ImGui::Text("Objective progress: %d / %d (%d%%)",
+            current, maximum, static_cast<int>(ratio * 100.0 + 0.5));
+        ImGui::Text("Track: %s  |  Reward: %d Astral Acclaim",
+            objective.Track.empty() ? "Wizard's Vault" : objective.Track.c_str(),
+            objective.Acclaim);
+        if (ready)
+            ImGui::TextColored(UBWarningColor(),
+                "Claim this reward in the Wizard's Vault in game.");
+        else if (objective.Claimed)
+            ImGui::TextColored(UBSuccessColor(),
+                "This objective's reward has been claimed.");
+        ImGui::TextDisabled("Objective ID: %d", objective.ID);
+        ImGui::Unindent();
+        ImGui::TreePop();
+    }
+    UBEndVisualCard(card);
+    ImGui::PopID();
+}
+
+void UBRenderVaultPeriod(const char* aTitle, const UBVaultPeriod& aPeriod)
+{
+    ImGui::PushID(aTitle);
+    if (!aPeriod.Loaded)
+    {
+        ImGui::TextWrapped("%s", aPeriod.Error.empty()
+            ? "Waiting for account data..." : aPeriod.Error.c_str());
+        ImGui::PopID();
+        return;
+    }
+
+    int claimedCount = 0;
+    int readyCount = 0;
+    for (const UBVaultObjective& objective : aPeriod.Objectives)
+    {
+        if (objective.Claimed) ++claimedCount;
+        else if (objective.Complete > 0 &&
+            objective.Current >= objective.Complete) ++readyCount;
+    }
+    const int pending = UBVaultPendingCount(aPeriod);
+    ImGui::TextColored(UBAccentColor(), "%s", aTitle);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d outstanding  |  %d ready to claim  |  %d claimed",
+        pending, readyCount, claimedCount);
+    ImGui::Spacing();
+
+    if (aPeriod.MetaComplete > 0)
+    {
+        const bool metaReady = aPeriod.MetaCurrent >= aPeriod.MetaComplete;
+        const ImVec4 metaColor = aPeriod.MetaClaimed ? UBSuccessColor()
+            : metaReady ? UBWarningColor() : UBAccentColor();
+        UBVisualCard card;
+        UBBeginVisualCard(card, true, true);
+        ImGui::TextColored(metaColor, "%s meta: %d/%d objectives%s",
+            aTitle, aPeriod.MetaCurrent, aPeriod.MetaComplete,
+            aPeriod.MetaClaimed ? "  |  Claimed" :
+            metaReady ? "  |  Reward ready to claim" : "");
+        const double ratio = static_cast<double>(aPeriod.MetaCurrent) /
+            static_cast<double>(aPeriod.MetaComplete);
+        UBRenderVaultProgressStrip(ratio, metaColor);
+        if (metaReady && !aPeriod.MetaClaimed && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Collect the meta reward in the Wizard's Vault.");
+        UBEndVisualCard(card);
+    }
+
+    if (aPeriod.Objectives.empty())
+    {
+        ImGui::TextDisabled("No objectives returned for this period.");
+        ImGui::PopID();
+        return;
+    }
+
+    // Outstanding objectives stay visible. Claimed objectives move into a
+    // disclosure group that is closed by default, but can be opened any time.
+    for (const UBVaultObjective& objective : aPeriod.Objectives)
+        if (!objective.Claimed) UBRenderVaultObjectiveCard(objective);
+
+    if (claimedCount > 0)
+    {
+        const std::string claimedLabel = "Claimed (" +
+            std::to_string(claimedCount) + ")##UBVaultClaimed";
+        if (ImGui::CollapsingHeader(claimedLabel.c_str()))
+        {
+            for (const UBVaultObjective& objective : aPeriod.Objectives)
+                if (objective.Claimed) UBRenderVaultObjectiveCard(objective);
+        }
+    }
+    if (pending == 0)
+        ImGui::TextColored(UBSuccessColor(), "All objectives claimed.");
+
+    ImGui::PopID();
+}
+
+void UBRenderVaultTab()
+{
+    // Per-session selection; no account data or notifications are modified.
+    static int selectedPeriod = 0; // 0 = Daily, 1 = Weekly
+    bool periodChanged = false;
+    ImGui::TextColored(UBAccentColor(), "Wizard's Vault objectives");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", ubVaultStatus.c_str());
+
+    // Preserve the working pulse preview and manual refresh controls.
+    if (ImGui::SmallButton("Preview tab pulse (15 seconds)"))
+        ubVaultPulsePreviewUntil = ImGui::GetTime() + 15.0;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Preview the orange tab glow; switch to Achievements to see it on an inactive tab.");
+    ImGui::SameLine();
+    if (!ubVaultSyncActive && apiKeyValid)
+    {
+        if (ImGui::SmallButton("Refresh daily / weekly progress"))
+            UBStartVaultSync();
+    }
+    else if (ubVaultSyncActive)
+        ImGui::TextDisabled("Refreshing in background...");
+    else
+        ImGui::TextDisabled("Validate an API key with account + progression permissions in Options.");
+
+    // Side-by-side selector keeps the other period one click away, regardless
+    // of the length of the list or the current scroll position.
+    const float scale = UBPresentationScale();
+    const float gap = 6.0f * scale;
+    const float available = ImGui::GetContentRegionAvail().x;
+    const float buttonWidth = (std::max)(80.0f * scale,
+        (available - gap) * 0.5f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f * scale);
+
+    auto renderPeriodButton = [&](int which, const std::string& label)
+        {
+            const bool selected = selectedPeriod == which;
+            ImGui::PushStyleColor(ImGuiCol_Button, selected
+                ? ImVec4(0.17f, 0.34f, 0.46f, 0.94f)
+                : ImVec4(0.11f, 0.16f, 0.22f, 0.90f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImVec4(0.24f, 0.43f, 0.56f, 0.98f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                ImVec4(0.19f, 0.38f, 0.52f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Border, selected
+                ? ImVec4(0.37f, 0.70f, 0.93f, 0.95f)
+                : ImVec4(0.22f, 0.29f, 0.36f, 0.75f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f * scale);
+            if (ImGui::Button(label.c_str(), ImVec2(buttonWidth, 0.0f)))
+            {
+                if (selectedPeriod != which)
+                {
+                    selectedPeriod = which;
+                    periodChanged = true;
+                }
+            }
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(4);
+        };
+
+    renderPeriodButton(0, "Daily (" +
+        std::to_string(UBVaultPendingCount(ubVaultDaily)) + ")##UBVaultDaily");
+    ImGui::SameLine(0.0f, gap);
+    renderPeriodButton(1, "Weekly (" +
+        std::to_string(UBVaultPendingCount(ubVaultWeekly)) + ")##UBVaultWeekly");
+    ImGui::PopStyleVar();
+    ImGui::Spacing();
+
+    // Only the objective list scrolls; the selector and pulse/refresh controls
+    // remain visible above it even after scrolling far down a weekly list.
+    ImGui::BeginChild("##UBVaultPeriodScroll", ImVec2(0.0f, 0.0f), false);
+    if (periodChanged) ImGui::SetScrollY(0.0f);
+    if (selectedPeriod == 0)
+        UBRenderVaultPeriod("Daily", ubVaultDaily);
+    else
+        UBRenderVaultPeriod("Weekly", ubVaultWeekly);
+    ImGui::Spacing();
+    ImGui::TextDisabled("Progress updates automatically about every five minutes.");
+    ImGui::EndChild();
+}
+
 void UBRenderProgressCardSummary(int aID, const AchievementProgress* aProgress,
     const std::string& aReason)
 {
@@ -5321,7 +6328,7 @@ void UBRenderProgressCardSummary(int aID, const AchievementProgress* aProgress,
     }
     else if (aProgress == nullptr)
     {
-        ImGui::TextColored(UBDangerColor(), "Not started");
+        ImGui::TextColored(UBDangerColor(), "No recorded progress");
     }
     else if (aProgress->Current >= 0 && aProgress->Max > 0)
     {
@@ -5383,7 +6390,7 @@ void UBRenderMapSummaryStats(size_t aAlmostDone, size_t aInProgress,
     ImGui::SameLine(0.0f, gap);
     UBRenderSummaryStat("In progress", aInProgress, UBWarningColor(), statWidth);
     ImGui::SameLine(0.0f, gap);
-    UBRenderSummaryStat("Not started", aNotStarted, UBDangerColor(), statWidth);
+    UBRenderSummaryStat("No progress", aNotStarted, UBDangerColor(), statWidth);
     if (aCharacterSpecific > 0)
     {
         ImGui::TextColored(UBSpecialColor(),
@@ -5425,7 +6432,8 @@ ImVec4 GetOpportunityDisplayColor(int aID)
 /// Forward declaration:
 ///----------------------------------------------------------------------------------------------------
 void RenderRecommendedOpportunity(
-    const OpportunityRecommendation& aRecommendation);
+    const OpportunityRecommendation& aRecommendation,
+    bool aMapContext = false);
 
 ///----------------------------------------------------------------------------------------------------
 /// CopyAchievementName:
@@ -5490,6 +6498,11 @@ const char* GetCoverageDisplayLabel()
         return "Exact";
     }
 
+    if (currentCoverageMode == MapCoverageMode::ContextualDiscovery)
+    {
+        return "Contextual / regional";
+    }
+
     if (currentCoverageMode == MapCoverageMode::CuratedMapping)
     {
         const bool hasDirect =
@@ -5524,6 +6537,11 @@ ImVec4 GetCoverageDisplayColor()
         return UBSuccessColor();
     }
 
+    if (currentCoverageMode == MapCoverageMode::ContextualDiscovery)
+    {
+        return UBSpecialColor();
+    }
+
     if (currentCoverageMode == MapCoverageMode::CuratedMapping)
     {
         if (!currentCoverageContextualCategories.empty() &&
@@ -5548,6 +6566,13 @@ const char* GetCoverageTooltip()
         return
             "Exact: this map has a matching GW2 achievement category. "
             "This is the strongest coverage mode.";
+    }
+
+    if (currentCoverageMode == MapCoverageMode::ContextualDiscovery)
+    {
+        return "Contextual discovery: matching public achievement text and "
+            "regional references. Regional goals may be elsewhere and "
+            "coverage is not exhaustive.";
     }
 
     if (currentCoverageMode == MapCoverageMode::CuratedMapping)
@@ -5591,14 +6616,15 @@ void RenderCharacterSpecificOpportunity(int aID)
     OpportunityRecommendation opportunity =
         BuildRecommendation(aID);
 
-    RenderRecommendedOpportunity(opportunity);
+    RenderRecommendedOpportunity(opportunity, true);
 }
 
 ///----------------------------------------------------------------------------------------------------
 /// RenderRecommendedOpportunity:
 ///----------------------------------------------------------------------------------------------------
 void RenderRecommendedOpportunity(
-    const OpportunityRecommendation& aRecommendation)
+    const OpportunityRecommendation& aRecommendation,
+    bool aMapContext)
 {
     auto definitionIt =
         achievementDefinitions.find(aRecommendation.ID);
@@ -5693,6 +6719,17 @@ void RenderRecommendedOpportunity(
 
     UBRenderProgressCardSummary(
         aRecommendation.ID, progress, primaryReason);
+    if (aMapContext)
+    {
+        UBRenderAvailability(aRecommendation.ID, false);
+    }
+
+    if (aMapContext &&
+        UBClassifyMapLead(aRecommendation.ID) == UBMapLeadKind::Regional)
+    {
+        ImGui::TextColored(UBMutedInfoColor(),
+            "Regional lead: location not confirmed on this map");
+    }
 
     const std::string actionabilityTag =
         GetActionabilityLabel(aRecommendation.ID);
@@ -5724,12 +6761,30 @@ void RenderRecommendedOpportunity(
 
         ImGui::Text(
             "Source: %s",
-            IsContextualMapOpportunity(
-                aRecommendation.ID
-            )
-            ? "Contextual map match"
-            : "Direct map category"
+            aMapContext
+            ? UBGetOpportunitySourceLabel(aRecommendation.ID)
+            : "Festival achievement"
         );
+        if (aMapContext)
+        {
+            UBRenderAvailability(aRecommendation.ID, true);
+        }
+
+        if (aMapContext)
+        {
+            auto vps = ubVpsCurrentCandidates.find(aRecommendation.ID);
+            if (vps != ubVpsCurrentCandidates.end())
+            {
+                ImGui::TextDisabled("VPS scope: %s | confidence: %s",
+                    vps->second.Scope.c_str(),
+                    vps->second.Confidence.c_str());
+                if (!vps->second.Evidence.empty())
+                {
+                    ImGui::TextWrapped("Public index evidence: %s",
+                        vps->second.Evidence.c_str());
+                }
+            }
+        }
 
         const OpportunityMetadata metadata =
             InferOpportunityMetadata(
@@ -5895,6 +6950,7 @@ void RenderOpportunityRow(int aID)
         compactReason = BuildRewardSummary(aID, *definition);
     }
     UBRenderProgressCardSummary(aID, progress, compactReason);
+    UBRenderAvailability(aID, false);
 
     if (opportunityOpen)
     {
@@ -5912,10 +6968,22 @@ void RenderOpportunityRow(int aID)
 
         ImGui::Text(
             "Source: %s",
-            IsContextualMapOpportunity(aID)
-            ? "Contextual map match"
-            : "Direct map category"
+            UBGetOpportunitySourceLabel(aID)
         );
+        UBRenderAvailability(aID, true);
+
+        auto publicEvidence = ubVpsCurrentCandidates.find(aID);
+        if (publicEvidence != ubVpsCurrentCandidates.end())
+        {
+            ImGui::TextDisabled("VPS scope: %s | confidence: %s",
+                publicEvidence->second.Scope.c_str(),
+                publicEvidence->second.Confidence.c_str());
+            if (!publicEvidence->second.Evidence.empty())
+            {
+                ImGui::TextWrapped("Public index evidence: %s",
+                    publicEvidence->second.Evidence.c_str());
+            }
+        }
 
         const OpportunityMetadata metadata =
             InferOpportunityMetadata(aID);
@@ -5984,7 +7052,7 @@ void RenderOpportunityRow(int aID)
         {
             ImGui::TextColored(
                 UBDangerColor(),
-                "Progress: Not started"
+                "Progress: No account progress record (availability unverified)"
             );
         }
         else if (progress->Current >= 0 && progress->Max > 0)
@@ -6117,8 +7185,39 @@ void CountCurrentMapOpportunityGroups(
 }
 
 ///----------------------------------------------------------------------------------------------------
+/// UBContainsWholePhrase:
+///     Avoids partial-word category and achievement text matches.
+///----------------------------------------------------------------------------------------------------
+bool UBContainsWholePhrase(
+    const std::string& aText,
+    const std::string& aPhrase)
+{
+    if (aPhrase.size() < 5 || aText.empty())
+    {
+        return false;
+    }
+
+    size_t at = aText.find(aPhrase);
+    while (at != std::string::npos)
+    {
+        const size_t end = at + aPhrase.size();
+        const bool leftBoundary = at == 0 ||
+            !std::isalnum(static_cast<unsigned char>(aText[at - 1]));
+        const bool rightBoundary = end == aText.size() ||
+            !std::isalnum(static_cast<unsigned char>(aText[end]));
+        if (leftBoundary && rightBoundary)
+        {
+            return true;
+        }
+        at = aText.find(aPhrase, at + 1);
+    }
+    return false;
+}
+
+///----------------------------------------------------------------------------------------------------
 /// DoesAchievementMatchCurrentMapText:
-///     Used only for achievements pulled from broad cross-map categories.
+///     Broad and regional categories must explicitly mention the relevant
+///     place in public text before they can become recommendations.
 ///----------------------------------------------------------------------------------------------------
 bool DoesAchievementMatchCurrentMapText(int aID)
 {
@@ -6142,11 +7241,18 @@ bool DoesAchievementMatchCurrentMapText(int aID)
             definition.Requirement
         );
 
+    if (currentOpportunityRegionalIDs.find(aID) !=
+        currentOpportunityRegionalIDs.end())
+    {
+        return UBContainsWholePhrase(
+            combined, ToLowerCopy(currentMapRegionName));
+    }
+
     for (const std::string& term :
         currentOpportunityMatchTerms)
     {
         if (!term.empty() &&
-            combined.find(term) != std::string::npos)
+            UBContainsWholePhrase(combined, term))
         {
             return true;
         }
@@ -6310,18 +7416,43 @@ void StartCurrentMapDefinitionSync(const std::vector<int>& aIDs)
         return;
     }
 
-    const std::vector<int> idsCopy = aIDs;
+    // Reuse session-cached definitions. Map changes should not redownload
+    // definitions which the account-wide or prior map scan already fetched.
+    std::vector<int> missingIDs;
+    missingIDs.reserve(aIDs.size());
+    std::unordered_set<int> seen;
+
+    for (int id : aIDs)
+    {
+        if (seen.insert(id).second &&
+            achievementDefinitions.find(id) == achievementDefinitions.end())
+        {
+            missingIDs.push_back(id);
+        }
+    }
+
+    currentMapDefinitionRequestMap = currentMapName;
+
+    if (missingIDs.empty())
+    {
+        currentMapDefinitionsReady = true;
+        BuildCurrentMapOpportunityList();
+        currentOpportunityStatus =
+            "Current-map opportunities ready from cached definitions.";
+        return;
+    }
 
     currentMapDefinitionSyncActive = true;
     currentMapDefinitionsReady = false;
     currentOpportunityStatus =
-        "Loading current-map achievement details...";
+        "Loading " + std::to_string(missingIDs.size()) +
+        " uncached map achievement definition(s)...";
 
     currentMapDefinitionSyncFuture = std::async(
         std::launch::async,
-        [idsCopy]()
+        [missingIDs]()
         {
-            return FetchAchievementDefinitionsForIDs(idsCopy);
+            return FetchAchievementDefinitionsForIDs(missingIDs);
         }
     );
 }
@@ -6347,6 +7478,24 @@ void UpdateCurrentMapDefinitionSync()
 
     currentMapDefinitionSyncActive = false;
 
+    if (result.Success)
+    {
+        for (auto& pair : result.Definitions)
+        {
+            achievementDefinitions[pair.first] =
+                std::move(pair.second);
+        }
+    }
+
+    // If the player moved during a request, never apply the old map's status
+    // or opportunity list to the new map. Rescan the new map next frame.
+    if (currentMapDefinitionRequestMap != currentMapName)
+    {
+        currentMapDefinitionsReady = false;
+        lastOpportunityMapName.clear();
+        return;
+    }
+
     if (!result.Success)
     {
         currentMapDefinitionsReady = false;
@@ -6357,15 +7506,8 @@ void UpdateCurrentMapDefinitionSync()
         return;
     }
 
-    for (auto& pair : result.Definitions)
-    {
-        achievementDefinitions[pair.first] =
-            std::move(pair.second);
-    }
-
     currentMapDefinitionsReady = true;
     BuildCurrentMapOpportunityList();
-
     currentOpportunityStatus =
         "Current-map opportunities ready.";
 }
@@ -7338,6 +8480,9 @@ const char* GetMapCoverageModeLabel()
     case MapCoverageMode::CuratedMapping:
         return "Curated map mapping";
 
+    case MapCoverageMode::ContextualDiscovery:
+        return "Contextual / regional discovery (partial)";
+
     default:
         return "No coverage";
     }
@@ -7457,6 +8602,41 @@ size_t CountUserFilteredCurrentMapIDs()
 /// UpdateCurrentMapOpportunityScan:
 ///     Matches the live map name to an achievement category.
 ///----------------------------------------------------------------------------------------------------
+// Skip festival/daily/retired categories in normal map discovery. Seasonal
+// content remains in the Holiday tab where its active dates are checked.
+bool UBIsNonMapCategory(const std::string& aName)
+{
+    const std::string lowered = ToLowerCopy(aName);
+    if (IsRetiredCategoryName(aName) ||
+        (lowered.size() >= 5 && lowered.compare(0, 5, "daily") == 0) ||
+        (lowered.size() >= 6 && lowered.compare(0, 6, "weekly") == 0) ||
+        (lowered.size() >= 6 && lowered.compare(0, 6, "annual") == 0) ||
+        lowered.find("pvp") != std::string::npos ||
+        lowered.find("wvw") != std::string::npos)
+    {
+        return true;
+    }
+
+    for (const FestivalDescriptor& festival : FestivalDescriptors)
+    {
+        for (const std::string& fragment : festival.CategoryNameFragments)
+        {
+            if (UBContainsWholePhrase(lowered, ToLowerCopy(fragment)))
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UpdateCurrentMapOpportunityScan:
+///     Preserve exact/curated mapping first, then discover map and regional
+///     candidates using public category and achievement text. Never imply
+///     full map coverage based only on an empty result set.
+///----------------------------------------------------------------------------------------------------
 void UpdateCurrentMapOpportunityScan()
 {
     if (!achievementCategoriesLoaded ||
@@ -7468,6 +8648,12 @@ void UpdateCurrentMapOpportunityScan()
         return;
     }
 
+    if (ubVpsRescanPending && !currentMapDefinitionSyncActive)
+    {
+        lastOpportunityMapName.clear();
+        ubVpsRescanPending = false;
+    }
+
     if (currentMapName == lastOpportunityMapName)
     {
         return;
@@ -7477,177 +8663,334 @@ void UpdateCurrentMapOpportunityScan()
     currentOpportunityCategoryName.clear();
     currentOpportunityCategoryIDs.clear();
     currentMapOpportunityIDs.clear();
+    ubVpsCurrentCandidates.clear();
+    ubVpsOnlyCandidateIDs.clear();
+    ubVpsMergedCount = 0;
+    ubVpsRegionalCount = 0;
     currentOpportunityDirectIDs.clear();
     currentOpportunityTextFilteredIDs.clear();
     currentOpportunityMatchTerms.clear();
-
-    currentCoverageMode = MapCoverageMode::None;
+    currentOpportunityRegionalIDs.clear();
     currentCoverageDirectCategories.clear();
     currentCoverageContextualCategories.clear();
-
+    currentCoverageMode = MapCoverageMode::None;
+    currentAutoMapMatchCount = 0;
+    currentRegionalMatchCount = 0;
+    currentDiscoveryScanComplete = achievementDefinitionsLoaded;
     currentMapDefinitionsReady = false;
 
-    const AchievementCategory* matchedCategory =
-        FindCategoryByName(currentMapName);
+    const std::string mapNeedle = ToLowerCopy(currentMapName);
+    const std::string regionNeedle = ToLowerCopy(currentMapRegionName);
+    const bool usableRegion = regionNeedle.size() >= 5 &&
+        regionNeedle != "tyria" && regionNeedle != "the mists" &&
+        regionNeedle != mapNeedle;
+    currentOpportunityMatchTerms.push_back(mapNeedle);
 
-    if (matchedCategory != nullptr)
+    // Build category eligibility once. Avoid searching every category for
+    // every definition during a map change (can be thousands of entries).
+    std::unordered_set<int> eligibleIDs;
+    std::unordered_set<int> excludedIDs;
+    for (const AchievementCategory& category : achievementCategories)
     {
-        currentCoverageMode =
-            MapCoverageMode::ExactCategory;
-
-        currentCoverageDirectCategories.push_back(
-            matchedCategory->Name
-        );
-
-        currentOpportunityCategoryName =
-            matchedCategory->Name;
-
-        currentOpportunityCategoryIDs =
-            matchedCategory->AchievementIDs;
-
-        for (int id : matchedCategory->AchievementIDs)
+        if (UBIsNonMapCategory(category.Name))
         {
-            currentOpportunityDirectIDs.insert(id);
+            // Do not promote old, daily or seasonal achievements to ordinary
+            // map recommendations, even if also listed in a broad category.
+            excludedIDs.insert(
+                category.AchievementIDs.begin(),
+                category.AchievementIDs.end());
+        }
+        else
+        {
+            eligibleIDs.insert(
+                category.AchievementIDs.begin(),
+                category.AchievementIDs.end());
         }
     }
-    else
+
+    std::unordered_set<int> knownIDs;
+    size_t regionalCandidateFetches = 0;
+    bool regionalCatalogTruncated = false;
+    constexpr size_t regionalCandidateLimit = 80;
+
+    auto addIDs = [&](const AchievementCategory& category,
+        bool requiresText, bool regional)
+        {
+            for (int id : category.AchievementIDs)
+            {
+                // Keep direct map IDs intact, but bound exploratory regional
+                // requests so they cannot hold up core map achievements.
+                if (regional && knownIDs.count(id) == 0 &&
+                    regionalCandidateFetches >= regionalCandidateLimit)
+                {
+                    regionalCatalogTruncated = true;
+                    continue;
+                }
+                if (knownIDs.insert(id).second)
+                {
+                    currentOpportunityCategoryIDs.push_back(id);
+                    if (regional)
+                    {
+                        ++regionalCandidateFetches;
+                    }
+                }
+                if (regional)
+                {
+                    if (currentOpportunityDirectIDs.count(id) == 0 &&
+                        currentOpportunityTextFilteredIDs.count(id) == 0)
+                    {
+                        currentOpportunityRegionalIDs.insert(id);
+                        currentOpportunityTextFilteredIDs.insert(id);
+                    }
+                }
+                else if (requiresText)
+                {
+                    if (currentOpportunityDirectIDs.count(id) == 0)
+                    {
+                        currentOpportunityRegionalIDs.erase(id);
+                        currentOpportunityTextFilteredIDs.insert(id);
+                    }
+                }
+                else
+                {
+                    currentOpportunityRegionalIDs.erase(id);
+                    currentOpportunityTextFilteredIDs.erase(id);
+                    currentOpportunityDirectIDs.insert(id);
+                }
+            }
+        };
+
+    // The authoritative exact category remains the strongest evidence.
+    const AchievementCategory* exact = FindCategoryByName(currentMapName);
+    if (exact != nullptr)
     {
-        const MapCategoryAlias* alias =
-            FindMapCategoryAliases(currentMapName);
+        currentCoverageMode = MapCoverageMode::ExactCategory;
+        currentCoverageDirectCategories.push_back(exact->Name);
+        currentOpportunityCategoryName = exact->Name;
+        addIDs(*exact, false, false);
+    }
 
-        if (alias == nullptr)
+    // Existing curated mappings continue to take precedence where available.
+    const MapCategoryAlias* alias = FindMapCategoryAliases(currentMapName);
+    if (alias != nullptr)
+    {
+        if (currentCoverageMode == MapCoverageMode::None)
         {
-            currentOpportunityStatus =
-                "No achievement mapping exists for this map yet.";
-            return;
+            currentCoverageMode = MapCoverageMode::CuratedMapping;
+            currentOpportunityCategoryName = currentMapName + " (curated)";
         }
-
-        currentCoverageMode =
-            MapCoverageMode::CuratedMapping;
-
-        std::vector<std::string> matchedPrimaryNames;
-        std::vector<std::string> matchedSecondaryNames;
-
-        currentOpportunityMatchTerms =
-            alias->MatchTerms;
-
-        for (const std::string& categoryName :
-            alias->PrimaryCategoryNames)
+        for (const std::string& term : alias->MatchTerms)
         {
-            const AchievementCategory* category =
-                FindCategoryByName(categoryName);
-
-            if (category == nullptr)
+            const std::string lowered = ToLowerCopy(term);
+            if (std::find(currentOpportunityMatchTerms.begin(),
+                currentOpportunityMatchTerms.end(), lowered) ==
+                currentOpportunityMatchTerms.end())
+            {
+                currentOpportunityMatchTerms.push_back(lowered);
+            }
+        }
+        for (const std::string& name : alias->PrimaryCategoryNames)
+        {
+            const AchievementCategory* category = FindCategoryByName(name);
+            if (category == nullptr || UBIsNonMapCategory(category->Name))
             {
                 continue;
             }
+            currentCoverageDirectCategories.push_back(category->Name);
+            addIDs(*category, false, false);
+        }
+        for (const std::string& name : alias->SecondaryCategoryNames)
+        {
+            const AchievementCategory* category = FindCategoryByName(name);
+            if (category == nullptr || UBIsNonMapCategory(category->Name))
+            {
+                continue;
+            }
+            currentCoverageContextualCategories.push_back(category->Name);
+            addIDs(*category, true, false);
+        }
+    }
 
-            matchedPrimaryNames.push_back(category->Name);
+    // Discover category names containing the *whole* current map name, rather
+    // than only the exact category or the hand-maintained mapping table.
+    for (const AchievementCategory& category : achievementCategories)
+    {
+        if (UBIsNonMapCategory(category.Name) ||
+            (exact != nullptr && category.ID == exact->ID))
+        {
+            continue;
+        }
+        const std::string categoryName = ToLowerCopy(category.Name);
+        if (UBContainsWholePhrase(categoryName, mapNeedle))
+        {
+            const size_t before = knownIDs.size();
+            addIDs(category, false, false);
+            currentAutoMapMatchCount += knownIDs.size() - before;
             currentCoverageDirectCategories.push_back(
-                category->Name
-            );
-
-            for (int id : category->AchievementIDs)
-            {
-                currentOpportunityDirectIDs.insert(id);
-
-                // Direct source wins if an ID also appears in a broad category.
-                currentOpportunityTextFilteredIDs.erase(id);
-            }
-
-            AppendUniqueAchievementIDs(
-                currentOpportunityCategoryIDs,
-                category->AchievementIDs
-            );
+                category.Name + " (auto-discovered)");
         }
-
-        for (const std::string& categoryName :
-            alias->SecondaryCategoryNames)
+        else if (usableRegion &&
+            UBContainsWholePhrase(categoryName, regionNeedle))
         {
-            const AchievementCategory* category =
-                FindCategoryByName(categoryName);
-
-            if (category == nullptr)
-            {
-                continue;
-            }
-
-            matchedSecondaryNames.push_back(category->Name);
+            addIDs(category, true, true);
             currentCoverageContextualCategories.push_back(
-                category->Name
-            );
+                category.Name + " (regional)");
+        }
+    }
 
-            for (int id : category->AchievementIDs)
+    // Search account-known public definitions for explicit references to the
+    // map, even when the category has an unrelated name. Only known cached
+    // definitions are scanned; unknown unstarted global achievements are not
+    // presented as complete or fully searched.
+    for (const auto& entry : achievementDefinitions)
+    {
+        const int id = entry.first;
+        const AchievementProgress* progress = FindAchievementProgress(id);
+        if ((progress != nullptr && progress->Done) ||
+            eligibleIDs.count(id) == 0 || excludedIDs.count(id) != 0)
+        {
+            continue;
+        }
+        const AchievementDefinition& definition = entry.second;
+        const std::string text = ToLowerCopy(
+            definition.Name + " " + definition.Description + " " +
+            definition.Requirement);
+        const bool mapMention = UBContainsWholePhrase(text, mapNeedle);
+        const bool regionalMention = !mapMention && usableRegion &&
+            UBContainsWholePhrase(
+                ToLowerCopy(definition.Name + " " + definition.Requirement),
+                regionNeedle);
+
+        if (mapMention)
+        {
+            if (knownIDs.insert(id).second)
             {
-                if (currentOpportunityDirectIDs.find(id) ==
-                    currentOpportunityDirectIDs.end())
-                {
-                    currentOpportunityTextFilteredIDs.insert(id);
-                }
+                currentOpportunityCategoryIDs.push_back(id);
+                ++currentAutoMapMatchCount;
             }
-
-            AppendUniqueAchievementIDs(
-                currentOpportunityCategoryIDs,
-                category->AchievementIDs
-            );
-        }
-
-        if (currentOpportunityCategoryIDs.empty())
-        {
-            currentOpportunityStatus =
-                "A curated map mapping exists, but none of its "
-                "achievement categories are currently available.";
-            return;
-        }
-
-        currentOpportunityCategoryName =
-            currentMapName + " (curated)";
-
-        currentOpportunityStatus =
-            "Using curated achievement mapping.";
-
-        if (!matchedPrimaryNames.empty())
-        {
-            currentOpportunityStatus += " Direct: ";
-
-            for (size_t i = 0;
-                i < matchedPrimaryNames.size();
-                ++i)
+            if (currentOpportunityDirectIDs.count(id) == 0)
             {
-                if (i > 0)
-                {
-                    currentOpportunityStatus += ", ";
-                }
-
-                currentOpportunityStatus +=
-                    matchedPrimaryNames[i];
+                currentOpportunityRegionalIDs.erase(id);
+                currentOpportunityTextFilteredIDs.insert(id);
             }
         }
-
-        if (!matchedSecondaryNames.empty())
+        else if (regionalMention &&
+            currentOpportunityDirectIDs.count(id) == 0 &&
+            currentOpportunityTextFilteredIDs.count(id) == 0)
         {
-            currentOpportunityStatus += " Contextual: ";
-
-            for (size_t i = 0;
-                i < matchedSecondaryNames.size();
-                ++i)
+            if (knownIDs.insert(id).second)
             {
-                if (i > 0)
+                currentOpportunityCategoryIDs.push_back(id);
+            }
+            currentOpportunityTextFilteredIDs.insert(id);
+            currentOpportunityRegionalIDs.insert(id);
+        }
+    }
+
+    // Merge the optional session-cached VPS evidence. This never sends any
+    // account data to the server; filtering remains entirely local.
+    if (ubVpsIndexEnabled && MumbleLink != nullptr &&
+        MumbleLink->Context.MapID == displayedMapID &&
+        currentMapName != "Loading map name...")
+    {
+        auto indexed = ubVpsCache.find(displayedMapID);
+        if (indexed != ubVpsCache.end())
+        {
+            for (const UBVpsCandidate& candidate : indexed->second.Candidates)
+            {
+                const int id = candidate.ID;
+                // Apply the same normal-category guardrails as local discovery:
+                // no daily, seasonal, retired, PvP, or WvW-only candidates.
+                if (eligibleIDs.count(id) == 0 || excludedIDs.count(id) != 0)
                 {
-                    currentOpportunityStatus += ", ";
+                    continue;
+                }
+                const AchievementProgress* progress = FindAchievementProgress(id);
+                if (progress != nullptr && progress->Done)
+                {
+                    continue;
                 }
 
-                currentOpportunityStatus +=
-                    matchedSecondaryNames[i];
+                const bool localAlreadyKnows = knownIDs.count(id) != 0;
+                ubVpsCurrentCandidates[id] = candidate;
+                if (!localAlreadyKnows)
+                {
+                    knownIDs.insert(id);
+                    ubVpsOnlyCandidateIDs.insert(id);
+                    currentOpportunityCategoryIDs.push_back(id);
+                    ++ubVpsMergedCount;
+                }
+
+                // Exact *category-name* evidence is comparable to the local
+                // map category scan. Text matches are classified later from
+                // their public GW2 definitions, not trusted blindly.
+                if (candidate.Scope == "map" &&
+                    ((candidate.Source == "category_name" &&
+                        candidate.Confidence == "explicit") ||
+                        candidate.Source == "reviewed"))
+                {
+                    currentOpportunityRegionalIDs.erase(id);
+                    currentOpportunityTextFilteredIDs.erase(id);
+                    currentOpportunityDirectIDs.insert(id);
+                }
+                else if (candidate.Scope == "regional" &&
+                    currentOpportunityDirectIDs.count(id) == 0)
+                {
+                    currentOpportunityRegionalIDs.insert(id);
+                    // No forced current-map text requirement: this is a
+                    // separately labeled regional research lead.
+                    currentOpportunityTextFilteredIDs.erase(id);
+                    ++ubVpsRegionalCount;
+                }
+                else if (candidate.Scope == "map" &&
+                    currentOpportunityDirectIDs.count(id) == 0)
+                {
+                    // UBClassifyMapLead promotes a map lead only if the
+                    // fetched GW2 definition explicitly names this map.
+                    currentOpportunityRegionalIDs.erase(id);
+                    currentOpportunityTextFilteredIDs.erase(id);
+                }
+            }
+            if (currentCoverageMode == MapCoverageMode::None &&
+                !ubVpsCurrentCandidates.empty())
+            {
+                currentCoverageMode = MapCoverageMode::ContextualDiscovery;
+                currentOpportunityCategoryName =
+                    currentMapName + " (public VPS candidates)";
             }
         }
+    }
+
+    currentRegionalMatchCount = currentOpportunityRegionalIDs.size();
+
+    if (regionalCatalogTruncated)
+    {
+        currentDiscoveryScanComplete = false;
+    }
+
+    if (currentCoverageMode == MapCoverageMode::None &&
+        !currentOpportunityCategoryIDs.empty())
+    {
+        currentCoverageMode = MapCoverageMode::ContextualDiscovery;
+        currentOpportunityCategoryName = currentMapName + " (discovered)";
     }
 
     if (currentOpportunityCategoryIDs.empty())
     {
+        // No verified candidate is not evidence of 100% completion.
+        currentMapDefinitionsReady = true;
         currentOpportunityStatus =
-            "This map mapping contains no achievement IDs.";
+            achievementDefinitionsLoaded
+            ? "Limited coverage: no verified map-specific candidates found. "
+            "This does not mean the map is completed."
+            : "Limited coverage: awaiting the public achievement catalog "
+            "for further map discovery.";
         return;
+    }
+
+    if (currentOpportunityCategoryName.empty())
+    {
+        currentOpportunityCategoryName = currentMapName + " (discovered)";
     }
 
     BuildCurrentMapOpportunityList();
@@ -7666,6 +9009,7 @@ void StartMapLookup(uint32_t aMapID)
 
     mapLookupActive = true;
     currentMapName = "Loading map name...";
+    currentMapRegionName.clear();
 
     mapLookupFuture = std::async(
         std::launch::async,
@@ -7723,9 +9067,11 @@ void UpdateMapLookup()
         if (result.Success)
         {
             currentMapName = result.Name;
+            currentMapRegionName = result.RegionName;
         }
         else
         {
+            currentMapRegionName.clear();
             currentMapName =
                 "Map lookup failed: " +
                 (result.Error.empty()
@@ -7887,6 +9233,12 @@ void StartApiKeyValidationForKey(
     apiValidationActive = true;
     apiKeyValid = false;
     apiKeyHasProgression = false;
+    ++ubVaultGeneration;
+    ubVaultDaily = UBVaultPeriod{};
+    ubVaultWeekly = UBVaultPeriod{};
+    ubVaultLatestSignature.clear();
+    ubVaultLastAttemptValid = false;
+    ubVaultStatus = "Waiting for API key validation...";
     apiKeyStatus = "Validating API key...";
 
     achievementDataLoaded = false;
@@ -7999,6 +9351,8 @@ void UpdateApiKeyValidation()
         StartAchievementSyncWithKey(
             pendingValidationKey
         );
+        // The key stays local; these requests go to the official GW2 API.
+        UBStartVaultSyncWithKey(pendingValidationKey);
     }
     else
     {
@@ -8041,7 +9395,7 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef()
     AddonDef.Name = "Unfinished Business";
 
     AddonDef.Version.Major = 0;
-    AddonDef.Version.Minor = 1;
+    AddonDef.Version.Minor = 2;
     AddonDef.Version.Build = 0;
     AddonDef.Version.Revision = 0;
 
@@ -8108,7 +9462,7 @@ void AddonLoad(AddonAPI_t* aApi)
     APIDefs->Log(
         LOGL_DEBUG,
         "Unfinished Business",
-        "Unfinished Business v0.1.2 loaded."
+        "Unfinished Business v0.2.0 VPS TEST loaded."
     );
 }
 
@@ -8117,6 +9471,17 @@ void AddonLoad(AddonAPI_t* aApi)
 ///----------------------------------------------------------------------------------------------------
 void AddonUnload()
 {
+    if (ubVaultSyncActive && ubVaultFuture.valid())
+    {
+        ubVaultFuture.wait();
+        ubVaultSyncActive = false;
+    }
+    if (ubVpsLookupActive && ubVpsLookupFuture.valid())
+    {
+        ubVpsLookupFuture.wait();
+        ubVpsLookupActive = false;
+    }
+
     if (mapLookupActive && mapLookupFuture.valid())
     {
         mapLookupFuture.wait();
@@ -8312,8 +9677,103 @@ std::vector<OpportunityRecommendation> UBBuildMapTabRecommendations(
 }
 
 ///----------------------------------------------------------------------------------------------------
-/// UBRenderMapTab: all the original card actions and list details, scoped to
-/// either ordinary map achievements or mastery-point achievements.
+/// UBSplitMapLeads:
+///     A lead belongs to exactly one group; never count regional or
+///     character-specific matches as confirmed unfinished map objectives.
+///----------------------------------------------------------------------------------------------------
+struct UBMapLeadGroups
+{
+    std::vector<int> OnMap;
+    std::vector<int> EventDependent;
+    std::vector<int> Regional;
+    std::vector<int> CharacterSpecific;
+    std::vector<int> Historical;
+};
+
+UBMapLeadGroups UBSplitMapLeads(const std::vector<int>& aIDs)
+{
+    UBMapLeadGroups groups;
+    for (int id : aIDs)
+    {
+        const UBAvailabilityInfo availability = UBGetAvailability(id);
+        if (availability.Status == UBAvailabilityStatus::Historical)
+        {
+            groups.Historical.push_back(id);
+            continue;
+        }
+        switch (UBClassifyMapLead(id))
+        {
+        case UBMapLeadKind::OnMap:
+            if (availability.Status == UBAvailabilityStatus::EventDependent)
+            {
+                groups.EventDependent.push_back(id);
+            }
+            else
+            {
+                groups.OnMap.push_back(id);
+            }
+            break;
+        case UBMapLeadKind::Regional:
+            groups.Regional.push_back(id);
+            break;
+        case UBMapLeadKind::CharacterSpecific:
+            groups.CharacterSpecific.push_back(id);
+            break;
+        }
+    }
+    return groups;
+}
+
+size_t UBCountRecordedUnfinished(const std::vector<int>& aIDs)
+{
+    size_t count = 0;
+    for (int id : aIDs)
+    {
+        const AchievementProgress* progress = FindAchievementProgress(id);
+        if (progress != nullptr && !progress->Done)
+        {
+            ++count;
+        }
+    }
+    return count;
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UBRenderLeadCards:
+///     Preserves the established detailed achievement cards. Only the
+///     first five recommendations display initially; all entries stay
+///     available in the expandable full list.
+///----------------------------------------------------------------------------------------------------
+void UBRenderLeadCards(const std::vector<int>& aIDs,
+    const char* aGroupID, const char* aAllLabel)
+{
+    const std::vector<OpportunityRecommendation> top =
+        UBBuildMapTabRecommendations(aIDs);
+
+    ImGui::PushID(aGroupID);
+    for (const OpportunityRecommendation& recommendation : top)
+    {
+        ImGui::PushID(recommendation.ID);
+        RenderRecommendedOpportunity(recommendation, true);
+        ImGui::PopID();
+    }
+
+    if (aIDs.size() > top.size() && ImGui::CollapsingHeader(aAllLabel))
+    {
+        for (int id : aIDs)
+        {
+            ImGui::PushID(id);
+            RenderOpportunityRow(id);
+            ImGui::PopID();
+        }
+    }
+    ImGui::PopID();
+}
+
+///----------------------------------------------------------------------------------------------------
+/// UBRenderMapTab:
+///     On-map matches, broader regional leads, and character-only
+///     candidates are separate in BOTH Achievements and Masteries tabs.
 ///----------------------------------------------------------------------------------------------------
 void UBRenderMapTab(bool masteryTab)
 {
@@ -8321,350 +9781,197 @@ void UBRenderMapTab(bool masteryTab)
     {
         ImGui::TextWrapped(
             "GW2 API access is not ready. Open Nexus Options -> "
-            "Unfinished Business to add or validate an API key."
-        );
+            "Unfinished Business to add or validate an API key.");
+        return;
     }
-    else if (achievementSyncActive ||
-        achievementDefinitionSyncActive ||
-        achievementCategorySyncActive ||
-        currentMapDefinitionSyncActive)
+    if (achievementSyncActive || achievementDefinitionSyncActive ||
+        achievementCategorySyncActive || currentMapDefinitionSyncActive)
     {
         ImGui::TextDisabled("Refreshing achievement data...");
+        return;
     }
-    else if (!achievementDataLoaded)
+    if (!achievementDataLoaded || !achievementCategoriesLoaded)
     {
         ImGui::TextDisabled("Waiting for achievement data...");
+        return;
     }
-    else if (!achievementCategoriesLoaded)
+    if (!currentMapDefinitionsReady)
     {
-        ImGui::TextWrapped(
-            "%s",
-            achievementCategoryStatus.c_str()
-        );
+        ImGui::TextWrapped("%s", currentOpportunityStatus.c_str());
+        return;
     }
-    else if (currentOpportunityCategoryName.empty())
+
+    const std::vector<int> tabIDs = UBGetMapTabOpportunityIDs(masteryTab);
+    const UBMapLeadGroups groups = UBSplitMapLeads(tabIDs);
+
+    ImGui::TextColored(masteryTab ? UBSpecialColor() : UBAccentColor(),
+        masteryTab ? "Mastery point discovery" : "Map achievement discovery");
+
+    ImGui::TextDisabled("Public VPS index: %s", ubVpsStatus.c_str());
+    if (ubVpsMergedCount != 0)
     {
-        if (masteryTab)
+        ImGui::TextDisabled(
+            "%llu additional public candidates merged; "
+            "account progress checked locally.",
+            static_cast<unsigned long long>(ubVpsMergedCount));
+    }
+    if (MumbleLink != nullptr && ubVpsIndexEnabled)
+    {
+        auto vpsData = ubVpsCache.find(MumbleLink->Context.MapID);
+        if (vpsData != ubVpsCache.end() && vpsData->second.Truncated)
         {
             ImGui::TextDisabled(
-                "No mapped mastery-point achievements on this map."
-            );
-            return;
+                "Public VPS results capped; location coverage is partial.");
         }
+    }
 
-        if (activeFestivalAvailable &&
-            currentOpportunityStatus ==
-            "No achievement mapping exists for this map yet.")
-        {
-            ImGui::TextWrapped(
-                "No permanent map-specific achievement mapping "
-                "exists for this map yet."
-            );
-        }
-        else
-        {
-            ImGui::TextWrapped(
-                "%s",
-                currentOpportunityStatus.c_str()
-            );
-        }
+    ImGui::TextDisabled(
+        "%llu map leads | %llu event-dependent | %llu regional | %llu character-only",
+        static_cast<unsigned long long>(groups.OnMap.size()),
+        static_cast<unsigned long long>(groups.EventDependent.size()),
+        static_cast<unsigned long long>(groups.Regional.size()),
+        static_cast<unsigned long long>(groups.CharacterSpecific.size()));
 
-        if (!masteryTab &&
-            currentCoverageMode == MapCoverageMode::None &&
-            currentMapDefinitionsReady)
+    if (tabIDs.empty())
+    {
+        ImGui::TextWrapped(
+            "No unfinished matches found in the available data. "
+            "This does not prove the map is complete.");
+        if (!masteryTab && currentCoverageMode == MapCoverageMode::None)
         {
-            ImGui::Spacing();
             ImGui::Separator();
             RenderLimitedCoverageLeads();
         }
+        return;
     }
-    else if (currentMapDefinitionsReady)
+
+    ImGui::Spacing();
+
+    // Only map-specific, account-tracked entries can contribute to the main
+    // progression summary. Regional and per-character leads never do.
+    size_t almostDone = 0;
+    size_t inProgress = 0;
+    size_t noProgress = 0;
+    size_t ignoredCharacterCount = 0;
+    UBCountMapTabOpportunityGroups(groups.OnMap,
+        almostDone, inProgress, noProgress, ignoredCharacterCount);
+
+    UBRenderMapSummaryStats(almostDone, inProgress, noProgress, 0);
+    ImGui::TextDisabled(
+        "%llu map matches have recorded unfinished account progress.",
+        static_cast<unsigned long long>(
+            UBCountRecordedUnfinished(groups.OnMap)));
+    if (noProgress > 0)
     {
-        // Separate mastery-point rewards from the standard achievement list.
-        // The view is filtered at render time: the underlying scanners,
-        // ranking metadata, and achievement lists are not changed.
-        const std::vector<int> tabOpportunityIDs =
-            UBGetMapTabOpportunityIDs(masteryTab);
+        ImGui::TextDisabled(
+            "No progress record does not confirm an objective is unlocked.");
+    }
 
-        if (tabOpportunityIDs.empty())
-        {
-            ImGui::TextDisabled(
-                masteryTab
-                ? "No unfinished mastery-point achievements for this map."
-                : "No unfinished regular achievements for this map."
-            );
-            return;
-        }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextColored(UBAccentColor(),
+        "On This Map (%llu)",
+        static_cast<unsigned long long>(groups.OnMap.size()));
+    ImGui::TextDisabled(
+        "Map-specific leads, not verified unlocks. Green = likely ongoing; "
+        "blue = unverified. Event and historical entries are separated.");
 
-        size_t almostDoneCount = 0;
-        size_t inProgressCount = 0;
-        size_t notStartedCount = 0;
-        size_t characterSpecificCount = 0;
+    if (groups.OnMap.empty())
+    {
+        ImGui::TextDisabled(
+            "No map-specific matches found in the currently loaded data.");
+    }
+    else
+    {
+        UBRenderLeadCards(groups.OnMap,
+            "##UBOnMapGroup", "All map-specific matches");
+    }
 
-        UBCountMapTabOpportunityGroups(
-            tabOpportunityIDs,
-            almostDoneCount,
-            inProgressCount,
-            notStartedCount,
-            characterSpecificCount
-        );
-
-        ImGui::TextColored(
-            masteryTab ? UBSpecialColor() : UBAccentColor(),
-            masteryTab ? "Mastery-point achievements" : "Map achievements"
-        );
-        ImGui::TextDisabled("%llu unfinished in this category",
-            static_cast<unsigned long long>(tabOpportunityIDs.size()));
-        ImGui::Spacing();
-
-        UBRenderMapSummaryStats(
-            almostDoneCount,
-            inProgressCount,
-            notStartedCount,
-            characterSpecificCount
-        );
-
+    if (!groups.EventDependent.empty())
+    {
         ImGui::Spacing();
         ImGui::Separator();
-
-        const size_t characterSpecificTopCount =
-            UBCountCharacterSpecificOpportunities(tabOpportunityIDs);
-
-        const bool hasAccountTracked =
-            UBHasAccountTrackedOpportunities(tabOpportunityIDs);
-
-        if (!hasAccountTracked &&
-            characterSpecificTopCount > 0)
+        ImGui::TextColored(UBWarningColor(),
+            "Event-dependent (%llu)",
+            static_cast<unsigned long long>(groups.EventDependent.size()));
+        ImGui::TextWrapped(
+            "Related to an event; current activity and eligibility are unverified.");
+        if (ImGui::CollapsingHeader("Show event-dependent leads##UBEvents"))
         {
-            ImGui::TextColored(
-                UBSpecialColor(),
-                "Character-specific opportunities in %s",
-                currentOpportunityCategoryName.c_str()
-            );
-
-            ImGui::TextDisabled(
-                "Exact progress is only visible in the in-game "
-                "Achievements panel."
-            );
-
-            ImGui::Spacing();
-
-            for (int id : tabOpportunityIDs)
-            {
-                if (!IsCharacterAdventureGuideAchievement(id))
-                {
-                    continue;
-                }
-
-                OpportunityRecommendation opportunity =
-                    BuildRecommendation(id);
-
-                ImGui::PushID(id);
-                RenderRecommendedOpportunity(opportunity);
-                ImGui::PopID();
-            }
+            UBRenderLeadCards(groups.EventDependent,
+                "##UBEventGroup", "All event-dependent leads");
         }
-        else
+    }
+
+    if (!groups.Regional.empty())
+    {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextColored(UBWarningColor(),
+            "Regional Leads (%llu)",
+            static_cast<unsigned long long>(groups.Regional.size()));
+        ImGui::TextWrapped(
+            "Related to the wider region, not necessarily this map. "
+            "These do not count as verified map objectives.");
+        UBRenderLeadCards(groups.Regional,
+            "##UBRegionalGroup", "All regional leads");
+    }
+
+    if (!groups.CharacterSpecific.empty())
+    {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextColored(UBSpecialColor(),
+            "Character-Specific Leads (%llu)",
+            static_cast<unsigned long long>(groups.CharacterSpecific.size()));
+        ImGui::TextWrapped(
+            "Character Adventure Guide progress is unavailable through "
+            "the account API. Check your current character in-game. "
+            "These are not counted as verified unfinished tasks.");
+
+        ImGui::PushID("##UBCharacterGroup");
+        const size_t previewCount =
+            std::min<size_t>(3, groups.CharacterSpecific.size());
+        for (size_t index = 0; index < previewCount; ++index)
         {
-            ImGui::TextColored(
-                UBAccentColor(),
-                masteryTab
-                ? "Recommended mastery points in %s"
-                : "Recommended achievements in %s",
-                currentOpportunityCategoryName.c_str()
-            );
-
-            ImGui::Spacing();
-
-            const std::vector<OpportunityRecommendation>
-                recommendations =
-                UBBuildMapTabRecommendations(tabOpportunityIDs);
-
-            if (recommendations.empty())
-            {
-                ImGui::TextDisabled(
-                    "No recommendations available."
-                );
-            }
-            else
-            {
-                for (size_t recommendationIndex = 0;
-                    recommendationIndex < recommendations.size();
-                    ++recommendationIndex)
-                {
-                    const OpportunityRecommendation&
-                        recommendation =
-                        recommendations[recommendationIndex];
-
-                    ImGui::PushID(
-                        static_cast<int>(
-                            recommendationIndex
-                            )
-                    );
-
-                    RenderRecommendedOpportunity(
-                        recommendation
-                    );
-
-                    ImGui::PopID();
-
-                }
-            }
+            const int id = groups.CharacterSpecific[index];
+            ImGui::PushID(id);
+            RenderCharacterSpecificOpportunity(id);
+            ImGui::PopID();
         }
-
-        if (hasAccountTracked &&
-            characterSpecificTopCount > 0)
+        if (groups.CharacterSpecific.size() > previewCount &&
+            ImGui::CollapsingHeader("Show remaining character-only leads"))
         {
-            ImGui::Spacing();
-            ImGui::Separator();
-
-            ImGui::TextColored(
-                UBSpecialColor(),
-                "Character-specific opportunities"
-            );
-
-            ImGui::TextDisabled(
-                "Exact progress is only visible in the in-game "
-                "Achievements panel."
-            );
-
-            ImGui::Spacing();
-
-            for (int id : tabOpportunityIDs)
+            for (size_t index = previewCount;
+                index < groups.CharacterSpecific.size(); ++index)
             {
-                if (!IsCharacterAdventureGuideAchievement(id))
-                {
-                    continue;
-                }
-
+                const int id = groups.CharacterSpecific[index];
                 ImGui::PushID(id);
                 RenderCharacterSpecificOpportunity(id);
                 ImGui::PopID();
             }
         }
-
-        ImGui::Spacing();
-
-        // If every visible opportunity is character-specific, the top
-        // section already shows the complete list. Do not duplicate it.
-        const bool showAllMapOpportunities =
-            hasAccountTracked;
-
-        if (showAllMapOpportunities)
-        {
-            ImGui::Separator();
-        }
-
-        if (showAllMapOpportunities &&
-            ImGui::CollapsingHeader(
-                masteryTab
-                ? "All account-tracked mastery points"
-                : "All account-tracked achievements"))
-        {
-            if (ImGui::BeginChild(
-                "##CurrentMapOpportunityList",
-                ImVec2(0.0f, 260.0f),
-                true))
-            {
-                if (almostDoneCount > 0)
-                {
-                    ImGui::TextColored(
-                        UBSuccessColor(),
-                        "Almost Done"
-                    );
-
-                    for (int id : tabOpportunityIDs)
-                    {
-                        const double ratio =
-                            GetAchievementProgressRatio(id);
-
-                        if (ratio < 0.75)
-                        {
-                            continue;
-                        }
-
-                        RenderOpportunityRow(id);
-                    }
-
-                    ImGui::Spacing();
-                }
-
-                if (inProgressCount > 0)
-                {
-                    ImGui::TextColored(
-                        UBWarningColor(),
-                        "In Progress"
-                    );
-
-                    for (int id : tabOpportunityIDs)
-                    {
-                        const AchievementProgress* progress =
-                            FindAchievementProgress(id);
-
-                        if (progress == nullptr)
-                        {
-                            continue;
-                        }
-
-                        const double ratio =
-                            GetAchievementProgressRatio(id);
-
-                        if (ratio >= 0.75)
-                        {
-                            continue;
-                        }
-
-                        RenderOpportunityRow(id);
-                    }
-
-                    ImGui::Spacing();
-                }
-
-                if (notStartedCount > 0)
-                {
-                    ImGui::TextColored(
-                        UBDangerColor(),
-                        "Not Started"
-                    );
-
-                    for (int id : tabOpportunityIDs)
-                    {
-                        if (IsCharacterAdventureGuideAchievement(id))
-                        {
-                            continue;
-                        }
-
-                        if (FindAchievementProgress(id) != nullptr)
-                        {
-                            continue;
-                        }
-
-                        RenderOpportunityRow(id);
-                    }
-
-                    ImGui::Spacing();
-                }
-
-                // Character-specific objectives are shown in their own
-                // dedicated section above and are intentionally not repeated here.
-
-                if (tabOpportunityIDs.empty())
-                {
-                    ImGui::TextDisabled(
-                        "No map opportunities found "
-                        "in this map category."
-                    );
-                }
-            }
-
-            ImGui::EndChild();
-        }
+        ImGui::PopID();
     }
-    else
+
+    // Historical entries are kept for transparency, but are not part of the
+    // main map recommendations or progression counters.
+    if (!groups.Historical.empty())
     {
-        ImGui::TextDisabled(
-            "Loading current-map achievement details..."
-        );
+        ImGui::Spacing();
+        ImGui::Separator();
+        const std::string historicalHeader =
+            "Historical / unavailable (" +
+            std::to_string(groups.Historical.size()) +
+            ") - research only##UBHistorical";
+        if (ImGui::CollapsingHeader(historicalHeader.c_str()))
+        {
+            ImGui::TextWrapped(
+                "Not currently verified as obtainable. These are hidden "
+                "from normal recommendations, even if their objectives name this map.");
+            UBRenderLeadCards(groups.Historical,
+                "##UBHistoricalGroup", "All historical leads");
+        }
     }
 }
 
@@ -8680,7 +9987,9 @@ bool UBRenderColoredTabButton(
     int aIcon,
     bool aSelected,
     const ImVec4& aAccent,
-    float aWidth)
+    float aWidth,
+    int aBadgeCount = 0,
+    bool aPulse = false)
 {
     const float scale = ImGui::GetFontSize() / 13.0f;
     const float height = 34.0f * scale;
@@ -8719,6 +10028,21 @@ bool UBRenderColoredTabButton(
     ImGui::PopStyleVar(2);
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
+    // New, unacknowledged objectives breathe visibly. The preview is allowed
+    // even on the selected tab, so users can confirm the animation works.
+    const bool previewingPulse = ImGui::GetTime() < ubVaultPulsePreviewUntil;
+    const bool drawPulse = aPulse && (!aSelected || previewingPulse);
+    const float pulseWave = drawPulse
+        ? 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 3.2f)
+        : 0.0f;
+    if (drawPulse)
+    {
+        draw->AddRectFilled(
+            ImVec2(min.x + 1.0f, min.y + 1.0f),
+            ImVec2(max.x - 1.0f, max.y - 1.0f),
+            ImGui::GetColorU32(ImVec4(aAccent.x, aAccent.y, aAccent.z,
+                0.045f + 0.14f * pulseWave)), 5.0f * scale);
+    }
     const ImU32 ink = ImGui::GetColorU32(aSelected
         ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
         : ImVec4(0.84f, 0.87f, 0.94f, 1.0f));
@@ -8757,6 +10081,15 @@ bool UBRenderColoredTabButton(
         draw->AddLine(ImVec2(cx - 8.0f * scale, cy),
             ImVec2(cx + 8.0f * scale, cy), iconInk, line);
     }
+    else if (aIcon == 3) // Dailies: small clock.
+    {
+        draw->AddCircle(ImVec2(cx, cy), 8.0f * scale,
+            iconInk, 20, line);
+        draw->AddLine(ImVec2(cx, cy),
+            ImVec2(cx, cy - 5.0f * scale), iconInk, line);
+        draw->AddLine(ImVec2(cx, cy),
+            ImVec2(cx + 4.0f * scale, cy + 2.0f * scale), iconInk, line);
+    }
     else // Holiday: wrapped festival gift.
     {
         draw->AddRect(
@@ -8788,6 +10121,29 @@ bool UBRenderColoredTabButton(
             ImGui::GetColorU32(aAccent), 1.0f * scale);
     }
 
+    // Bright outline on unacknowledged new objectives, or while previewing.
+    if (drawPulse)
+    {
+        draw->AddRect(ImVec2(min.x + 1.0f, min.y + 1.0f),
+            ImVec2(max.x - 1.0f, max.y - 1.0f),
+            ImGui::GetColorU32(ImVec4(aAccent.x, aAccent.y, aAccent.z,
+                0.35f + 0.65f * pulseWave)), 5.0f * scale,
+            ImDrawCornerFlags_All, (1.75f + 2.25f * pulseWave) * scale);
+    }
+    if (aBadgeCount > 0)
+    {
+        const ImVec2 center(max.x - 11.0f * scale,
+            min.y + 10.0f * scale);
+        draw->AddCircleFilled(center, 10.0f * scale,
+            ImGui::GetColorU32(ImVec4(0.95f, 0.46f, 0.16f, 1.0f)));
+        const std::string label = aBadgeCount > 9 ? "9+" :
+            std::to_string(aBadgeCount);
+        const ImVec2 size = ImGui::CalcTextSize(label.c_str());
+        draw->AddText(ImVec2(center.x - size.x * 0.5f,
+            center.y - size.y * 0.5f),
+            ImGui::GetColorU32(ImVec4(0.08f, 0.08f, 0.08f, 1.0f)),
+            label.c_str());
+    }
     if (hoveredNow)
     {
         ImGui::SetTooltip("%s", aTooltip);
@@ -8804,7 +10160,17 @@ void AddonRender()
     MaybeExpireApiKeyInput();
 
     UpdateMapLookup();
+    UBUpdatePublicVpsIndex();
     UpdateApiKeyValidation();
+    UBUpdateVaultSync();
+    if (apiKeyValid && !ubVaultSyncActive &&
+        (!ubVaultLastAttemptValid ||
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - ubVaultLastAttempt).count() >=
+            ubVaultRefreshSeconds))
+    {
+        UBStartVaultSync();
+    }
     UpdateAchievementSync();
     UpdateAchievementDefinitionSync();
     UpdateAchievementCategorySync();
@@ -8815,7 +10181,7 @@ void AddonRender()
     UpdateFestivalDefinitionSync();
     MaybeRefreshFestivalSchedule();
 
-    if (achievementDefinitionsLoaded &&
+    if (achievementDataLoaded &&
         !achievementCategoriesLoaded &&
         !achievementCategorySyncActive &&
         !achievementCategorySyncAttempted)
@@ -8876,7 +10242,7 @@ void AddonRender()
             "Unfinished Business"
         );
         ImGui::SameLine();
-        ImGui::TextDisabled("v0.1.2");
+        ImGui::TextDisabled("v0.2.0 VPS TEST");
 
         ImGui::Separator();
 
@@ -8890,9 +10256,23 @@ void AddonRender()
 
             if (!currentOpportunityCategoryName.empty())
             {
-                ImGui::TextDisabled("%llu opportunities",
+                const UBMapLeadGroups overview =
+                    UBSplitMapLeads(currentMapOpportunityIDs);
+                ImGui::TextDisabled(
+                    "%llu map matches (%llu with recorded progress)",
+                    static_cast<unsigned long long>(overview.OnMap.size()),
                     static_cast<unsigned long long>(
-                        currentMapOpportunityIDs.size()));
+                        UBCountRecordedUnfinished(overview.OnMap)));
+                if (!overview.EventDependent.empty() ||
+                    !overview.Regional.empty() ||
+                    !overview.CharacterSpecific.empty())
+                {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("| %llu event | %llu regional | %llu character-only",
+                        static_cast<unsigned long long>(overview.EventDependent.size()),
+                        static_cast<unsigned long long>(overview.Regional.size()),
+                        static_cast<unsigned long long>(overview.CharacterSpecific.size()));
+                }
             }
 
             if (achievementCategoriesLoaded)
@@ -8924,11 +10304,26 @@ void AddonRender()
         // Keep the map context visible while the category content scrolls.
         ImGui::Separator();
 
-        // Three equally sized, color-coded tab buttons. Icons are vector-drawn
-        // so they remain visible even when the Nexus font lacks emoji glyphs.
-        static int activeCategoryTab = 0; // 0 Achievements, 1 Masteries, 2 Holiday
+        // Four vector-icon tabs; the Daily/Weekly tab can pulse when new
+        // outstanding objectives have not been viewed this period.
+        static int activeCategoryTab = 0; // 0 Achievements, 1 Masteries, 2 Dailies, 3 Holiday
+        // If the user is already viewing this tab when a refresh completes,
+        // treat that result as viewed instead of alerting after they leave.
+        if (activeCategoryTab == 2 && !ubVaultLatestSignature.empty() &&
+            ubVaultAcknowledgedSignature != ubVaultLatestSignature)
+        {
+            ubVaultAcknowledgedSignature = ubVaultLatestSignature;
+            SaveUserPreferences();
+        }
         const float tabGap = 6.0f * (ImGui::GetFontSize() / 13.0f);
-        const float tabWidth = (ImGui::GetContentRegionAvail().x - tabGap * 2.0f) / 3.0f;
+        const float tabWidth = (ImGui::GetContentRegionAvail().x - tabGap * 3.0f) / 4.0f;
+        const int vaultPending = UBVaultPendingCount(ubVaultDaily) +
+            UBVaultPendingCount(ubVaultWeekly);
+        const bool previewPulse = ImGui::GetTime() < ubVaultPulsePreviewUntil;
+        const bool vaultPulse = previewPulse ||
+            (ubVaultAnimateTab && vaultPending > 0 &&
+                !ubVaultLatestSignature.empty() &&
+                ubVaultLatestSignature != ubVaultAcknowledgedSignature);
 
         if (UBRenderColoredTabButton(
             "Achievements", "##UBTabAchievements",
@@ -8949,12 +10344,28 @@ void AddonRender()
         }
         ImGui::SameLine(0.0f, tabGap);
         if (UBRenderColoredTabButton(
-            "Holiday", "##UBTabHoliday",
-            "Seasonal festival achievements", 2,
+            tabWidth < 170.0f ? "Daily/Weekly" : "Daily + Weekly", "##UBTabVault",
+            "Current Wizard's Vault daily and weekly objectives", 3,
             activeCategoryTab == 2,
-            ImVec4(1.0f, 0.69f, 0.35f, 1.0f), tabWidth))
+            ImVec4(1.0f, 0.53f, 0.29f, 1.0f), tabWidth,
+            vaultPending, vaultPulse))
         {
             activeCategoryTab = 2;
+            if (!ubVaultLatestSignature.empty() &&
+                ubVaultAcknowledgedSignature != ubVaultLatestSignature)
+            {
+                ubVaultAcknowledgedSignature = ubVaultLatestSignature;
+                SaveUserPreferences();
+            }
+        }
+        ImGui::SameLine(0.0f, tabGap);
+        if (UBRenderColoredTabButton(
+            "Holiday", "##UBTabHoliday",
+            "Seasonal festival achievements", 2,
+            activeCategoryTab == 3,
+            ImVec4(1.0f, 0.69f, 0.35f, 1.0f), tabWidth))
+        {
+            activeCategoryTab = 3;
         }
 
         ImGui::Spacing();
@@ -8972,6 +10383,12 @@ void AddonRender()
                 "Achievements in this map that reward mastery points.");
             ImGui::Spacing();
             UBRenderMapTab(true);
+            ImGui::EndChild();
+        }
+        else if (activeCategoryTab == 2)
+        {
+            ImGui::BeginChild("##DailyWeeklyTabBody", ImVec2(0.0f, 0.0f), false);
+            UBRenderVaultTab();
             ImGui::EndChild();
         }
         else
@@ -9198,6 +10615,12 @@ void AddonOptions()
 
         apiKeyValid = false;
         apiKeyHasProgression = false;
+        ++ubVaultGeneration;
+        ubVaultDaily = UBVaultPeriod{};
+        ubVaultWeekly = UBVaultPeriod{};
+        ubVaultLatestSignature.clear();
+        ubVaultLastAttemptValid = false;
+        ubVaultStatus = "No API key validated.";
         apiKeyStatus = "No API key validated.";
 
         achievementDataLoaded = false;
@@ -9231,6 +10654,10 @@ void AddonOptions()
         currentOpportunityDirectIDs.clear();
         currentOpportunityTextFilteredIDs.clear();
         currentOpportunityMatchTerms.clear();
+        currentOpportunityRegionalIDs.clear();
+        currentAutoMapMatchCount = 0;
+        currentRegionalMatchCount = 0;
+        currentDiscoveryScanComplete = false;
 
         currentCoverageMode = MapCoverageMode::None;
         currentCoverageDirectCategories.clear();
@@ -9300,6 +10727,10 @@ void AddonOptions()
             &autoRefreshAchievementProgress
         );
 
+    preferencesChanged |= ImGui::Checkbox(
+        "Animate Daily + Weekly tab for outstanding objectives",
+        &ubVaultAnimateTab);
+
     ImGui::Spacing();
     ImGui::TextColored(
         UBAccentColor(),
@@ -9361,6 +10792,37 @@ void AddonOptions()
         "Coverage & Mapping",
         ImGuiTreeNodeFlags_None))
     {
+        if (ImGui::Checkbox("Use public VPS map index (optional)",
+            &ubVpsIndexEnabled))
+        {
+            SaveUserPreferences();
+            // Rebuild local recommendations with/without cached VPS data.
+            if (!currentMapDefinitionSyncActive)
+            {
+                lastOpportunityMapName.clear();
+            }
+            else
+            {
+                ubVpsRescanPending = true;
+            }
+        }
+        ImGui::TextWrapped(
+            "VPS: %s. Only public map ID sent. No account key or progress.",
+            ubVpsStatus.c_str());
+        ImGui::Text("Additional public candidates: %llu",
+            static_cast<unsigned long long>(ubVpsMergedCount));
+        if (MumbleLink != nullptr && ubVpsIndexEnabled &&
+            !ubVpsLookupActive &&
+            ubVpsAttemptedMaps.count(MumbleLink->Context.MapID) != 0 &&
+            ubVpsCache.count(MumbleLink->Context.MapID) == 0)
+        {
+            if (ImGui::Button("Retry public VPS lookup"))
+            {
+                ubVpsAttemptedMaps.erase(MumbleLink->Context.MapID);
+            }
+        }
+
+        ImGui::Separator();
         ImGui::TextWrapped(
             "Current map: %s",
             currentMapName.c_str()
@@ -9421,6 +10883,19 @@ void AddonOptions()
                 currentOpportunityTextFilteredIDs.size()
                 )
         );
+        ImGui::Text(
+            "Auto-discovered map IDs: %llu",
+            static_cast<unsigned long long>(currentAutoMapMatchCount));
+        ImGui::Text(
+            "Regional candidates: %llu",
+            static_cast<unsigned long long>(currentRegionalMatchCount));
+        if (!currentDiscoveryScanComplete)
+        {
+            ImGui::TextWrapped(
+                "Discovery is partial: the public achievement catalog "
+                "may still be loading or regional candidates were capped. "
+                "No results does not mean the map is complete.");
+        }
 
         if (currentMapDefinitionsReady)
         {
@@ -9446,11 +10921,20 @@ void AddonOptions()
             );
 
             ImGui::Text(
-                "Visible unfinished: %llu",
+                "Visible candidate IDs (all groups): %llu",
                 static_cast<unsigned long long>(
                     currentMapOpportunityIDs.size()
                     )
             );
+            const UBMapLeadGroups diagnosticGroups =
+                UBSplitMapLeads(currentMapOpportunityIDs);
+            ImGui::Text("Map-specific matches: %llu (recorded unfinished: %llu)",
+                static_cast<unsigned long long>(diagnosticGroups.OnMap.size()),
+                static_cast<unsigned long long>(
+                    UBCountRecordedUnfinished(diagnosticGroups.OnMap)));
+            ImGui::Text("Regional leads: %llu | Character-only: %llu",
+                static_cast<unsigned long long>(diagnosticGroups.Regional.size()),
+                static_cast<unsigned long long>(diagnosticGroups.CharacterSpecific.size()));
         }
 
         ImGui::Spacing();
